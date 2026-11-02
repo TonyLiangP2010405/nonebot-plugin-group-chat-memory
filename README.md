@@ -1,12 +1,14 @@
 # nonebot-plugin-group-chat-memory
 
-为 NoneBot2 OneBot v11 群聊提供按群隔离的长期向量记忆、@/回复对话和按群概率随机回复。插件使用 SQLite + sqlite-vec 保存原文、分块、向量和群配置，聊天与 Embedding 均请求可配置的 OpenAI 兼容 HTTP API。
+为 NoneBot2 OneBot v11 群聊提供按群隔离的长期向量记忆、@/回复对话和按群概率随机回复。插件使用 SQLite 保存原文、分块、向量和群配置，聊天与 Embedding 均请求可配置的 OpenAI 兼容 HTTP API。
 
 ## 环境与安装
 
 - Python 3.10+
 - NoneBot2 2.2+
 - OneBot v11 适配器与对应的 OneBot 协议端
+
+优先使用 sqlite-vec 原生向量索引。如果当前 Python 的 `sqlite3` 不支持加载扩展（例如部分 python.org/Homebrew Python 3.13/3.14 构建），插件会自动改用 SQLite BLOB 保存向量并在 Python 中计算余弦相似度；启动日志会给出提示，功能保持可用。旧 sqlite-vec 数据库中缺少 BLOB 向量的已就绪片段会自动重新排队向量化。
 
 选择一种安装方式：
 

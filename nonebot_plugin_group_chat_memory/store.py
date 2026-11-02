@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
+import sqlite3
+import struct
 from collections.abc import AsyncIterator, Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 
 import aiosqlite
@@ -12,7 +15,13 @@ import sqlite_vec
 from .config import RUNTIME_CONFIG_DEFAULTS, Config
 from .models import Chunk, ChunkStatus, Message
 
+logger = logging.getLogger(__name__)
+
 DIMENSIONS_META_KEY = "embedding_dimensions"
+
+
+def _supports_load_extension() -> bool:
+    return hasattr(sqlite3.Connection, "enable_load_extension")
 
 _SCHEMA_STATEMENTS = (
     """
@@ -66,6 +75,17 @@ _SCHEMA_STATEMENTS = (
     CREATE INDEX IF NOT EXISTS idx_messages_unchunked
         ON messages(group_id, id) WHERE chunk_id IS NULL
     """,
+    """
+    CREATE TABLE IF NOT EXISTS memory_vector_blobs (
+        chunk_id INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+        group_id INTEGER NOT NULL,
+        embedding BLOB NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_vector_blobs_group
+        ON memory_vector_blobs(group_id)
+    """,
 )
 
 _VECTOR_TABLE_STATEMENT = """
@@ -85,10 +105,11 @@ class MemoryStore:
         self._dimensions = config.group_chat_memory_embedding_dimensions
         self._default_probability = config.group_chat_memory_default_probability
         self._db: aiosqlite.Connection | None = None
+        self._use_sqlite_vec = False
         self._lock = asyncio.Lock()
 
     async def open(self) -> None:
-        """打开数据库、加载 sqlite-vec 并创建缺失的表结构。"""
+        """打开数据库；优先加载 sqlite-vec，不支持时使用 BLOB 向量回退。"""
         async with self._lock:
             if self._db is not None:
                 return
@@ -96,23 +117,57 @@ class MemoryStore:
             path = self._config.database_path
             path.parent.mkdir(parents=True, exist_ok=True)
             db = await aiosqlite.connect(path, isolation_level=None)
+            use_sqlite_vec = _supports_load_extension()
             try:
                 db.row_factory = aiosqlite.Row
-                await db.enable_load_extension(True)
-                await db.load_extension(sqlite_vec.loadable_path())
-                await db.enable_load_extension(False)
+                if use_sqlite_vec:
+                    try:
+                        await db.enable_load_extension(True)
+                        await db.load_extension(sqlite_vec.loadable_path())
+                    except Exception as exc:
+                        logger.warning(
+                            "sqlite-vec 加载失败，改用 SQLite BLOB 向量检索：%s",
+                            type(exc).__name__,
+                        )
+                        use_sqlite_vec = False
+                    finally:
+                        if hasattr(db, "enable_load_extension"):
+                            with suppress(Exception):
+                                await db.enable_load_extension(False)
+                else:
+                    logger.warning(
+                        "当前 Python 的 sqlite3 不支持加载扩展，改用 SQLite BLOB 向量检索。"
+                    )
                 await db.execute("PRAGMA journal_mode = WAL")
                 await db.execute("PRAGMA foreign_keys = ON")
                 await db.execute("PRAGMA busy_timeout = 5000")
                 await db.execute("PRAGMA synchronous = NORMAL")
                 self._db = db
+                self._use_sqlite_vec = use_sqlite_vec
                 async with self._transaction_on(db) as tx:
                     for statement in _SCHEMA_STATEMENTS:
                         await tx.execute(statement)
                     await self._ensure_dimensions(tx)
-                    await tx.execute(_VECTOR_TABLE_STATEMENT.format(dimensions=self._dimensions))
+                    if use_sqlite_vec:
+                        await tx.execute(
+                            _VECTOR_TABLE_STATEMENT.format(dimensions=self._dimensions)
+                        )
+                    else:
+                        cursor = await tx.execute(
+                            "UPDATE chunks SET status = ? WHERE status = ? AND NOT EXISTS ("
+                            "SELECT 1 FROM memory_vector_blobs AS b WHERE b.chunk_id = chunks.id"
+                            ")",
+                            (ChunkStatus.PENDING.value, ChunkStatus.READY.value),
+                        )
+                        if cursor.rowcount > 0:
+                            logger.warning(
+                                "%s 个片段缺少 BLOB 向量，已重新排队等待向量化。",
+                                cursor.rowcount,
+                            )
+                        await cursor.close()
             except BaseException:
                 self._db = None
+                self._use_sqlite_vec = False
                 await db.close()
                 raise
 
@@ -282,11 +337,21 @@ class MemoryStore:
             await cursor.close()
             if row is None:
                 return
-            await db.execute("DELETE FROM memory_vectors WHERE chunk_id = ?", (chunk_id,))
-            await db.execute(
-                "INSERT INTO memory_vectors(chunk_id, group_id, embedding) VALUES (?, ?, ?)",
-                (chunk_id, row["group_id"], sqlite_vec.serialize_float32(embedding)),
-            )
+            if self._use_sqlite_vec:
+                await db.execute("DELETE FROM memory_vectors WHERE chunk_id = ?", (chunk_id,))
+                await db.execute(
+                    "INSERT INTO memory_vectors(chunk_id, group_id, embedding) VALUES (?, ?, ?)",
+                    (chunk_id, row["group_id"], sqlite_vec.serialize_float32(embedding)),
+                )
+            else:
+                await db.execute(
+                    "DELETE FROM memory_vector_blobs WHERE chunk_id = ?", (chunk_id,)
+                )
+                await db.execute(
+                    "INSERT INTO memory_vector_blobs(chunk_id, group_id, embedding) "
+                    "VALUES (?, ?, ?)",
+                    (chunk_id, row["group_id"], _pack_vector(embedding)),
+                )
             await db.execute(
                 "UPDATE chunks SET status = ? WHERE id = ?",
                 (ChunkStatus.READY.value, chunk_id),
@@ -299,21 +364,46 @@ class MemoryStore:
             return []
         async with self._lock:
             db = self._require_db()
+            if self._use_sqlite_vec:
+                cursor = await db.execute(
+                    "SELECT c.id, c.group_id, c.text, c.status FROM ("
+                    "SELECT chunk_id, distance FROM memory_vectors "
+                    "WHERE embedding MATCH ? AND k = ? AND group_id = ?"
+                    ") AS v JOIN chunks AS c ON c.id = v.chunk_id ORDER BY v.distance",
+                    (sqlite_vec.serialize_float32(embedding), limit, group_id),
+                )
+                rows = await cursor.fetchall()
+                await cursor.close()
+                return [_row_to_chunk(row) for row in rows]
+
             cursor = await db.execute(
-                "SELECT c.id, c.group_id, c.text, c.status FROM ("
-                "SELECT chunk_id, distance FROM memory_vectors "
-                "WHERE embedding MATCH ? AND k = ? AND group_id = ?"
-                ") AS v JOIN chunks AS c ON c.id = v.chunk_id ORDER BY v.distance",
-                (sqlite_vec.serialize_float32(embedding), limit, group_id),
+                "SELECT c.id, c.group_id, c.text, c.status, b.embedding "
+                "FROM memory_vector_blobs AS b JOIN chunks AS c ON c.id = b.chunk_id "
+                "WHERE b.group_id = ? AND c.status = ?",
+                (group_id, ChunkStatus.READY.value),
             )
             rows = await cursor.fetchall()
             await cursor.close()
-        return [_row_to_chunk(row) for row in rows]
+        scored = [
+            (
+                _cosine_similarity(embedding, _unpack_vector(row["embedding"], self._dimensions)),
+                int(row["id"]),
+                row,
+            )
+            for row in rows
+            if len(row["embedding"]) == self._dimensions * 4
+        ]
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [_row_to_chunk(row) for _, _, row in scored[:limit]]
 
     async def clear_group(self, group_id: int) -> None:
         """删除当前群的消息、片段与向量，保留概率配置。"""
         async with self._transaction() as db:
-            await db.execute("DELETE FROM memory_vectors WHERE group_id = ?", (group_id,))
+            await db.execute(
+                "DELETE FROM memory_vector_blobs WHERE group_id = ?", (group_id,)
+            )
+            if self._use_sqlite_vec:
+                await db.execute("DELETE FROM memory_vectors WHERE group_id = ?", (group_id,))
             await db.execute("DELETE FROM messages WHERE group_id = ?", (group_id,))
             await db.execute("DELETE FROM chunks WHERE group_id = ?", (group_id,))
 
@@ -405,6 +495,23 @@ def _validated_vector(vector: list[float], dimensions: int) -> list[float]:
     if not all(math.isfinite(item) for item in values):
         raise ValueError("向量包含非有限数值。")
     return values
+
+
+def _pack_vector(vector: list[float]) -> bytes:
+    return struct.pack(f"<{len(vector)}f", *vector)
+
+
+def _unpack_vector(value: bytes, dimensions: int) -> list[float]:
+    return list(struct.unpack(f"<{dimensions}f", value))
+
+
+def _cosine_similarity(left: list[float], right: list[float]) -> float:
+    dot = sum(a * b for a, b in zip(left, right, strict=True))
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if left_norm == 0.0 or right_norm == 0.0:
+        return 0.0
+    return dot / (left_norm * right_norm)
 
 
 def _utc_now() -> datetime:
