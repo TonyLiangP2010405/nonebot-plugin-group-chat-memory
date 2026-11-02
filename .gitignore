@@ -6,6 +6,17 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 dist/
+build/
 *.egg-info/
 .coverage
 htmlcov/
+
+.env
+.env.*
+!.env.example
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
