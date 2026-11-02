@@ -35,6 +35,8 @@ logger = logging.getLogger(__name__)
 GENERIC_REPLY_ERROR = "暂时无法生成回复，请稍后再试。"
 PERMISSION_DENIED = "仅 SUPERUSER 可执行此命令。"
 INVALID_PROBABILITY = "概率需为 0～100 的数字，最多一位小数。"
+INVALID_HOURLY_LIMIT = "每小时请求上限必须是 1 到 10000 的整数。"
+RATE_LIMIT_NOTICE = "本群本小时请求次数已用完，请稍后再来。"
 PROBABILITY_PATTERN = re.compile(r"(?:100(?:\.0)?|\d{1,2}(?:\.\d)?)")
 SECRET_COMMAND_LOG_PATTERN = re.compile(r"(设置聊天密钥|设置向量密钥)\s+[^\r\n]*")
 
@@ -231,6 +233,9 @@ probability_matcher = on_command(
 clear_matcher = on_command(
     "清空群记忆", rule=_eligible_group_message, priority=-1001, block=True
 )
+hourly_limit_matcher = on_command(
+    "每小时次数", rule=_eligible_group_message, priority=-1001, block=True
+)
 group_message_matcher = on_message(rule=_eligible_group_message, priority=-1000, block=False)
 
 
@@ -263,6 +268,27 @@ async def handle_clear(bot: Bot, event: GroupMessageEvent) -> None:
     await clear_matcher.finish("已清空当前群记忆。")
 
 
+@hourly_limit_matcher.handle()
+async def handle_hourly_limit(
+    bot: Bot,
+    event: GroupMessageEvent,
+    args: Annotated[Message, CommandArg()],
+) -> None:
+    if not await SUPERUSER(bot, event):
+        await hourly_limit_matcher.finish(PERMISSION_DENIED)
+
+    text = args.extract_plain_text().strip()
+    if not text:
+        limit = await store.get_hourly_limit(event.group_id)
+        await hourly_limit_matcher.finish(f"当前群每小时请求上限：{limit} 次")
+    if not text.isdigit() or not 1 <= int(text) <= 10000:
+        await hourly_limit_matcher.finish(INVALID_HOURLY_LIMIT)
+
+    limit = int(text)
+    await store.set_hourly_limit(event.group_id, limit)
+    await hourly_limit_matcher.finish(f"已设置当前群每小时请求上限：{limit} 次")
+
+
 @group_message_matcher.handle()
 async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     explicit_at = any(
@@ -290,12 +316,16 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     _bots[event.group_id] = bot
     await writer.record(memory_message)
     if directed:
-        coordinator.submit(event.group_id, memory_message, explicit=True)
+        if await store.consume_request_slot(event.group_id):
+            coordinator.submit(event.group_id, memory_message, explicit=True)
+        else:
+            await bot.send_group_msg(group_id=event.group_id, message=RATE_LIMIT_NOTICE)
         raise StopPropagation
     elif (
         event.reply is None
         and all(segment.type == "text" for segment in event.message)
         and await coordinator.should_random_reply(event.group_id)
+        and await store.consume_request_slot(event.group_id)
     ):
         coordinator.submit(event.group_id, memory_message, explicit=False)
 

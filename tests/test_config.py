@@ -29,6 +29,7 @@ class TestConfigDefaults:
         assert config.group_chat_memory_chunk_size == 10
         assert config.group_chat_memory_long_term_memories == 5
         assert config.group_chat_memory_default_probability == 0.0
+        assert config.group_chat_memory_hourly_request_limit == 10
         assert config.group_chat_memory_ignored_qq == set()
         assert config.group_chat_memory_db_path_override is None
 

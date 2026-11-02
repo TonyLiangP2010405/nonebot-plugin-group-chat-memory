@@ -7,7 +7,7 @@ import sqlite3
 import struct
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager, suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import aiosqlite
 import sqlite_vec
@@ -41,8 +41,21 @@ _SCHEMA_STATEMENTS = (
         group_id INTEGER PRIMARY KEY,
         probability REAL NOT NULL DEFAULT 0
             CHECK (probability >= 0 AND probability <= 100),
+        hourly_limit INTEGER NOT NULL DEFAULT 10
+            CHECK (hourly_limit >= 1 AND hourly_limit <= 10000),
         updated_at TEXT NOT NULL
     )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS request_usage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        group_id INTEGER NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE,
+        requested_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_request_usage_group_time
+        ON request_usage(group_id, requested_at)
     """,
     """
     CREATE TABLE IF NOT EXISTS chunks (
@@ -104,6 +117,7 @@ class MemoryStore:
         self._config = config
         self._dimensions = config.group_chat_memory_embedding_dimensions
         self._default_probability = config.group_chat_memory_default_probability
+        self._default_hourly_limit = config.group_chat_memory_hourly_request_limit
         self._db: aiosqlite.Connection | None = None
         self._use_sqlite_vec = False
         self._lock = asyncio.Lock()
@@ -147,6 +161,7 @@ class MemoryStore:
                 async with self._transaction_on(db) as tx:
                     for statement in _SCHEMA_STATEMENTS:
                         await tx.execute(statement)
+                    await self._ensure_groups_hourly_limit(tx)
                     await self._ensure_dimensions(tx)
                     if use_sqlite_vec:
                         await tx.execute(
@@ -242,6 +257,88 @@ class MemoryStore:
                 "probability = excluded.probability, updated_at = excluded.updated_at",
                 (group_id, probability, _format_timestamp(_utc_now())),
             )
+
+    async def get_hourly_limit(self, group_id: int) -> int:
+        """返回当前群每小时模型请求上限。"""
+        async with self._lock:
+            db = self._require_db()
+            cursor = await db.execute(
+                "SELECT hourly_limit FROM groups WHERE group_id = ?", (group_id,)
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        if row is None:
+            return self._default_hourly_limit
+        return int(row["hourly_limit"])
+
+    async def set_hourly_limit(self, group_id: int, value: int) -> None:
+        """设置当前群每小时模型请求上限，范围 1 到 10000。"""
+        limit = int(value)
+        if not 1 <= limit <= 10000:
+            raise ValueError("每小时请求上限必须是 1 到 10000 的整数。")
+        async with self._transaction() as db:
+            await db.execute(
+                "INSERT INTO groups(group_id, probability, hourly_limit, updated_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(group_id) DO UPDATE SET "
+                "hourly_limit = excluded.hourly_limit, updated_at = excluded.updated_at",
+                (
+                    group_id,
+                    self._default_probability,
+                    limit,
+                    _format_timestamp(_utc_now()),
+                ),
+            )
+
+    async def consume_request_slot(
+        self, group_id: int, now: datetime | None = None
+    ) -> bool:
+        """在滚动 60 分钟窗口内尝试占用一次模型请求名额。"""
+        current = _as_utc(now or _utc_now())
+        timestamp = current.timestamp()
+        cutoff = (current - timedelta(hours=1)).timestamp()
+        async with self._transaction() as db:
+            await self._ensure_group(db, group_id)
+            await db.execute(
+                "DELETE FROM request_usage WHERE group_id = ? AND requested_at <= ?",
+                (group_id, cutoff),
+            )
+            cursor = await db.execute(
+                "SELECT count(*) AS usage FROM request_usage WHERE group_id = ?",
+                (group_id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            cursor = await db.execute(
+                "SELECT hourly_limit FROM groups WHERE group_id = ?", (group_id,)
+            )
+            group_row = await cursor.fetchone()
+            await cursor.close()
+            limit = (
+                int(group_row["hourly_limit"])
+                if group_row is not None
+                else self._default_hourly_limit
+            )
+            if row is not None and int(row["usage"]) >= limit:
+                return False
+            await db.execute(
+                "INSERT INTO request_usage(group_id, requested_at) VALUES (?, ?)",
+                (group_id, timestamp),
+            )
+            return True
+
+    async def get_hour_usage(self, group_id: int, now: datetime | None = None) -> int:
+        """返回当前群滚动 60 分钟窗口内已占用的请求次数。"""
+        cutoff = (_as_utc(now or _utc_now()) - timedelta(hours=1)).timestamp()
+        async with self._lock:
+            db = self._require_db()
+            cursor = await db.execute(
+                "SELECT count(*) AS usage FROM request_usage "
+                "WHERE group_id = ? AND requested_at > ?",
+                (group_id, cutoff),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        return int(row["usage"]) if row is not None else 0
 
     async def get_runtime_config(self) -> dict[str, str]:
         """读取全 Bot 共用的模型运行时配置。"""
@@ -397,13 +494,14 @@ class MemoryStore:
         return [_row_to_chunk(row) for _, _, row in scored[:limit]]
 
     async def clear_group(self, group_id: int) -> None:
-        """删除当前群的消息、片段与向量，保留概率配置。"""
+        """删除当前群的消息、片段、向量和请求计数，保留概率与每小时上限。"""
         async with self._transaction() as db:
             await db.execute(
                 "DELETE FROM memory_vector_blobs WHERE group_id = ?", (group_id,)
             )
             if self._use_sqlite_vec:
                 await db.execute("DELETE FROM memory_vectors WHERE group_id = ?", (group_id,))
+            await db.execute("DELETE FROM request_usage WHERE group_id = ?", (group_id,))
             await db.execute("DELETE FROM messages WHERE group_id = ?", (group_id,))
             await db.execute("DELETE FROM chunks WHERE group_id = ?", (group_id,))
 
@@ -433,10 +531,25 @@ class MemoryStore:
 
     async def _ensure_group(self, db: aiosqlite.Connection, group_id: int) -> None:
         await db.execute(
-            "INSERT INTO groups(group_id, probability, updated_at) VALUES (?, ?, ?) "
-            "ON CONFLICT(group_id) DO NOTHING",
-            (group_id, self._default_probability, _format_timestamp(_utc_now())),
+            "INSERT INTO groups(group_id, probability, hourly_limit, updated_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(group_id) DO NOTHING",
+            (
+                group_id,
+                self._default_probability,
+                self._default_hourly_limit,
+                _format_timestamp(_utc_now()),
+            ),
         )
+
+    async def _ensure_groups_hourly_limit(self, db: aiosqlite.Connection) -> None:
+        cursor = await db.execute("PRAGMA table_info(groups)")
+        rows = await cursor.fetchall()
+        await cursor.close()
+        if not any(row["name"] == "hourly_limit" for row in rows):
+            await db.execute(
+                f"ALTER TABLE groups ADD COLUMN hourly_limit INTEGER NOT NULL DEFAULT "
+                f"{self._default_hourly_limit}"
+            )
 
     async def _ensure_dimensions(self, db: aiosqlite.Connection) -> None:
         cursor = await db.execute("SELECT value FROM meta WHERE key = ?", (DIMENSIONS_META_KEY,))

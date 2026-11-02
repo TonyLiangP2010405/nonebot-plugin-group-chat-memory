@@ -113,12 +113,18 @@ async def runtime(monkeypatch):
     get_probability = AsyncMock(return_value=0.0)
     set_probability = AsyncMock()
     clear_group = AsyncMock()
+    get_hourly_limit = AsyncMock(return_value=10)
+    set_hourly_limit = AsyncMock()
+    consume_request_slot = AsyncMock(return_value=True)
     monkeypatch.setattr(handlers.writer, "record", record)
     monkeypatch.setattr(handlers.context_builder, "build", build)
     monkeypatch.setattr(handlers.chat_client, "complete", complete)
     monkeypatch.setattr(handlers.store, "get_probability", get_probability)
     monkeypatch.setattr(handlers.store, "set_probability", set_probability)
     monkeypatch.setattr(handlers.store, "clear_group", clear_group)
+    monkeypatch.setattr(handlers.store, "get_hourly_limit", get_hourly_limit)
+    monkeypatch.setattr(handlers.store, "set_hourly_limit", set_hourly_limit)
+    monkeypatch.setattr(handlers.store, "consume_request_slot", consume_request_slot)
     coordinator = ReplyCoordinator(handlers.store, handlers.reply)
     monkeypatch.setattr(handlers, "coordinator", coordinator)
     saved_config = {
@@ -139,6 +145,9 @@ async def runtime(monkeypatch):
             get_probability=get_probability,
             set_probability=set_probability,
             clear_group=clear_group,
+            get_hourly_limit=get_hourly_limit,
+            set_hourly_limit=set_hourly_limit,
+            consume_request_slot=consume_request_slot,
             coordinator=coordinator,
         )
     finally:
@@ -437,7 +446,9 @@ async def test_probability_setting_rejects_invalid_input(app: App, runtime, valu
     runtime.complete.assert_not_awaited()
 
 
-@pytest.mark.parametrize("command", ["/回复概率", "/回复概率 50", "/清空群记忆"])
+@pytest.mark.parametrize(
+    "command", ["/回复概率", "/回复概率 50", "/清空群记忆", "/每小时次数 20"]
+)
 async def test_non_superuser_gets_short_denial_without_side_effects(
     app: App, runtime, command
 ):
@@ -839,6 +850,7 @@ async def test_concurrent_updates_to_same_field_match_final_database_value(
 def test_group_commands_and_chat_have_highest_priority():
     assert handlers.probability_matcher.priority == -1001
     assert handlers.clear_matcher.priority == -1001
+    assert handlers.hourly_limit_matcher.priority == -1001
     assert handlers.chat_url_matcher.priority == -1001
     assert handlers.chat_key_matcher.priority == -1001
     assert handlers.chat_model_matcher.priority == -1001
@@ -861,3 +873,85 @@ async def test_directed_message_stops_lower_priority_plugins(runtime, monkeypatc
     runtime.record.assert_awaited_once()
     coordinator.submit.assert_called_once()
     assert coordinator.submit.call_args.kwargs["explicit"] is True
+
+
+async def test_hourly_limit_query_is_superuser_only(app: App, runtime):
+    runtime.get_hourly_limit.return_value = 7
+    event = make_group_event("/每小时次数", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, "当前群每小时请求上限：7 次", result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.hourly_limit_matcher)
+
+    runtime.record.assert_not_awaited()
+    runtime.complete.assert_not_awaited()
+
+
+async def test_hourly_limit_setting_is_not_recorded(app: App, runtime):
+    event = make_group_event("/每小时次数 20", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, "已设置当前群每小时请求上限：20 次", result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.hourly_limit_matcher)
+
+    runtime.set_hourly_limit.assert_awaited_once_with(GROUP_ID, 20)
+    runtime.record.assert_not_awaited()
+    runtime.complete.assert_not_awaited()
+
+
+@pytest.mark.parametrize("value", ["0", "10001", "1.5", "abc", "-1"])
+async def test_hourly_limit_rejects_invalid_values(app: App, runtime, value):
+    event = make_group_event(f"/每小时次数 {value}", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, "每小时请求上限必须是 1 到 10000 的整数。", result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.hourly_limit_matcher)
+
+    runtime.set_hourly_limit.assert_not_awaited()
+
+
+async def test_explicit_rate_limit_sends_notice_without_model(app: App, runtime):
+    runtime.consume_request_slot.return_value = False
+    event = make_group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text("点名")])
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_api(
+            "send_group_msg",
+            {
+                "group_id": GROUP_ID,
+                "message": "本群本小时请求次数已用完，请稍后再来。",
+            },
+            {"message_id": 123},
+        )
+        ctx.receive_event(bot, event)
+        await ctx.run()
+
+    runtime.record.assert_awaited_once()
+    runtime.complete.assert_not_awaited()
+    runtime.consume_request_slot.assert_awaited_once_with(GROUP_ID)
+
+
+async def test_random_rate_limit_is_silent_without_model(app: App, runtime):
+    runtime.get_probability.return_value = 100.0
+    runtime.consume_request_slot.return_value = False
+    event = make_group_event("随机消息")
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.receive_event(bot, event)
+        await ctx.run()
+
+    runtime.record.assert_awaited_once()
+    runtime.complete.assert_not_awaited()
+    runtime.consume_request_slot.assert_awaited_once_with(GROUP_ID)
