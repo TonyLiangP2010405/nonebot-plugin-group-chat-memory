@@ -38,12 +38,11 @@ class _GroupState:
     def has_pending(self) -> bool:
         return bool(self.explicit) or self.latest_random is not None
 
-    def discard_pending(self) -> int:
-        """丢弃全部等待中的请求，返回丢弃条数（用于关闭日志）。"""
-        pending = len(self.explicit) + (1 if self.latest_random is not None else 0)
-        self.explicit.clear()
+    def discard_random(self) -> bool:
+        """丢弃等待中的随机请求；点名请求保留给 worker 排空。"""
+        had_random = self.latest_random is not None
         self.latest_random = None
-        return pending
+        return had_random
 
 
 class ReplyCoordinator:
@@ -55,7 +54,9 @@ class ReplyCoordinator:
 
     提交时只保存消息本身，不复制上下文；`reply` 回调在实际执行时才构建上下文，
     因此回复使用的永远是执行时刻的群聊状态。单个请求的异常被隔离并记录日志，
-    不会中断该群后续请求。`submit` 必须在事件循环中调用；关闭后不再接受请求。
+    不会中断该群后续请求；`reply` 抛出的 `CancelledError` 会结束 worker，并由
+    监督回调为剩余请求重新拉起 worker。`submit` 必须在事件循环中调用；关闭后
+    不再接受请求，已接受的点名请求仍会全部执行完毕。
     """
 
     def __init__(
@@ -100,24 +101,19 @@ class ReplyCoordinator:
         self._ensure_worker(group_id, state)
 
     async def close(self) -> None:
-        """停止所有每群 worker：不再接受新请求，等待在途回复结束。
+        """停止接受新请求，并在所有已接受的点名请求回复完毕后关闭 worker。
 
-        等待中的请求在关闭时被丢弃（只记录群号与条数），在途回复会执行完毕，
-        因此关闭后不会遗留任何 worker 任务。可重复调用；调用方取消 `close()`
-        不会级联取消 worker，取消异常照常向上抛出，可再次调用完成收尾。
+        已接受的 explicit（点名/回复）请求全部执行完毕才返回；等待中的随机请求
+        被丢弃（只记录群号，不含正文），在途回复也会执行完毕，因此关闭后不会
+        遗留任何 worker 任务。可重复调用；调用方取消 `close()` 不会级联取消
+        worker，取消异常照常向上抛出，可再次调用完成收尾。
         """
         first = not self._closing
         self._closing = True
         tasks: list[asyncio.Task[None]] = []
         for group_id, state in list(self._groups.items()):
-            if first:
-                pending = state.discard_pending()
-                if pending:
-                    logger.warning(
-                        "回复协调器关闭，群 %s 的 %s 条等待中的回复请求被丢弃。",
-                        group_id,
-                        pending,
-                    )
+            if first and state.discard_random():
+                logger.warning("回复协调器关闭，群 %s 的等待中的随机回复请求被丢弃。", group_id)
             state.wake.set()
             task = state.task
             if task is not None and not task.done():
@@ -138,9 +134,11 @@ class ReplyCoordinator:
         )
 
     async def _run_group(self, group_id: int, state: _GroupState) -> None:
-        while not self._closing:
+        while True:
             message = state.take_next()
             if message is None:
+                if self._closing:
+                    return
                 state.wake.clear()
                 if state.has_pending():
                     continue
@@ -156,9 +154,13 @@ class ReplyCoordinator:
             state.task = None
         if self._closing:
             self._groups.pop(group_id, None)
+        elif state.has_pending():
+            # 回复被取消等异常结束 worker 时, 由监督回调立即续跑剩余请求.
+            state.wake.set()
+            self._ensure_worker(group_id, state)
         if task.cancelled():
             if not self._closing:
-                logger.warning("群 %s 的回复 worker 被意外取消。", group_id)
+                logger.warning("群 %s 的回复 worker 被取消。", group_id)
             return
         error = task.exception()
         if error is not None and not self._closing:

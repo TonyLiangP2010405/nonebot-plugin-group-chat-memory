@@ -51,13 +51,20 @@ def reply_workers() -> set[asyncio.Task]:
 class FakeReply:
     """记录回复调用；默认在每条回复上等待独立闸门，便于精确控制交错。"""
 
-    def __init__(self, *, auto: bool = False, fail_on: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        auto: bool = False,
+        fail_on: set[str] | None = None,
+        cancel_on: set[str] | None = None,
+    ) -> None:
         self.calls: list[tuple[int, Message]] = []
         self.completed: list[tuple[int, str]] = []
         self.entered: asyncio.Queue[tuple[int, str]] = asyncio.Queue()
         self.gates: list[asyncio.Event] = []
         self.auto = auto
         self.fail_on = fail_on or set()
+        self.cancel_on = cancel_on or set()
 
     async def __call__(self, group_id: int, message: Message) -> None:
         self.calls.append((group_id, message))
@@ -66,6 +73,8 @@ class FakeReply:
             gate = asyncio.Event()
             self.gates.append(gate)
             await gate.wait()
+        if message.text in self.cancel_on:
+            raise asyncio.CancelledError
         self.completed.append((group_id, message.text))
         if message.text in self.fail_on:
             raise RuntimeError("聊天请求失败：HTTP 502")
@@ -375,6 +384,8 @@ class TestErrorIsolation:
         assert reply.texts == ["第一条", "第二条"]
         assert "100" in caplog.text
         assert "RuntimeError" in caplog.text
+        assert "回复失败" in caplog.text
+        assert "意外退出" not in caplog.text
         assert "第一条" not in caplog.text
 
     async def test_failed_random_reply_does_not_stop_the_group(self, make_coordinator):
@@ -386,6 +397,29 @@ class TestErrorIsolation:
         coordinator.submit(100, make_message(100, "随机二", index=1), False)
         await wait_until(lambda: len(reply.calls) == 2)
         assert reply.texts == ["随机一", "随机二"]
+
+
+class TestWorkerRecovery:
+    async def test_cancelled_reply_does_not_strand_queued_explicit_requests(
+        self, make_coordinator, caplog
+    ):
+        reply = FakeReply(cancel_on={"第一条"})
+        coordinator = make_coordinator(reply)
+        coordinator.submit(100, make_message(100, "第一条"), True)
+        assert await reply.next_call() == (100, "第一条")
+        coordinator.submit(100, make_message(100, "第二条", index=1), True)
+
+        with caplog.at_level(logging.WARNING):
+            reply.release(0)
+            # 不再提交任何新请求, 监督回调必须自行拉起 worker 处理排队的第二条.
+            assert await reply.next_call() == (100, "第二条")
+            reply.release(1)
+            await wait_until(lambda: reply.completed == [(100, "第二条")])
+
+        assert reply.texts == ["第一条", "第二条"]
+        assert "被取消" in caplog.text
+        assert "100" in caplog.text
+        assert "第一条" not in caplog.text
 
 
 class TestClose:
@@ -405,27 +439,54 @@ class TestClose:
         assert reply.completed == [(100, "在途")]
         assert reply.texts == ["在途"]
 
-    async def test_close_discards_waiting_requests_without_content(self, make_coordinator, caplog):
+    async def test_close_drains_accepted_explicit_and_discards_random(
+        self, make_coordinator, caplog
+    ):
         reply = FakeReply()
         coordinator = make_coordinator(reply)
         coordinator.submit(100, make_message(100, "在途"), True)
         assert await reply.next_call() == (100, "在途")
         coordinator.submit(100, make_message(100, "排队", index=1), True)
-        coordinator.submit(100, make_message(100, "随机", index=2), False)
+        coordinator.submit(100, make_message(100, "随机内容", index=2), False)
 
         with caplog.at_level(logging.WARNING):
             close_task = asyncio.create_task(coordinator.close())
             await asyncio.sleep(0.01)
             assert not close_task.done()
             reply.release(0)
+
+            assert await reply.next_call() == (100, "排队")
+            reply.release(1)
             await asyncio.wait_for(close_task, 1.0)
 
-        assert reply.texts == ["在途"]
-        assert reply.completed == [(100, "在途")]
+        assert reply.texts == ["在途", "排队"]
+        assert reply.completed == [(100, "在途"), (100, "排队")]
+        assert reply_workers() == set()
         assert "丢弃" in caplog.text
         assert "100" in caplog.text
         assert "排队" not in caplog.text
-        assert "随机" not in caplog.text
+        assert "随机内容" not in caplog.text
+
+    async def test_close_drains_every_accepted_explicit_request(self, make_coordinator):
+        reply = FakeReply()
+        coordinator = make_coordinator(reply)
+        for index, text in enumerate(("一", "二", "三")):
+            coordinator.submit(100, make_message(100, text, index=index), True)
+        assert await reply.next_call() == (100, "一")
+
+        close_task = asyncio.create_task(coordinator.close())
+        await asyncio.sleep(0.01)
+        assert not close_task.done()
+
+        for index, text in ((0, "一"), (1, "二"), (2, "三")):
+            if index:
+                assert await reply.next_call() == (100, text)
+            reply.release(index)
+        await asyncio.wait_for(close_task, 1.0)
+
+        assert reply.texts == ["一", "二", "三"]
+        assert reply.completed == [(100, "一"), (100, "二"), (100, "三")]
+        assert reply_workers() == set()
 
     async def test_close_leaves_no_workers(self, make_coordinator):
         baseline = asyncio.all_tasks()
