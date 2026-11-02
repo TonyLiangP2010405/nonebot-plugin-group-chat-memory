@@ -59,6 +59,8 @@ COMMAND_START=["/"]
 
 聊天地址填到 API 根路径（通常包含 `/v1`），插件分别请求其下的 `/chat/completions` 和 `/embeddings`。默认聊天模型标识是 `deepseek-v4.1-flash`，但**模型标识必须以实际服务商支持的值为准**。这四项保存到 SQLite，不再读取同名环境变量，更新后立即生效且重启后保留。使用 `/模型配置` 可查询脱敏状态。
 
+使用 OpenCode Go 直连 API 时，地址是 `https://opencode.ai/inference/go/openai/v1`，模型是 `deepseek-v4.1-flash`。插件会发送自己的 User-Agent，并对 OpenCode 请求附带按群稳定的 `x-opencode-session`，避免被网关当作通用 SDK 流量。
+
 ## 其余环境配置字段
 
 四个模型运行时字段不再通过 env 设置。其余以下字段可写在 NoneBot `.env` 中；集合类值使用 JSON 格式。

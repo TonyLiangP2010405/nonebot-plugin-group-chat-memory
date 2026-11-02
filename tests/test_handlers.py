@@ -349,7 +349,8 @@ async def test_excluded_events_do_nothing(app: App, runtime, monkeypatch, kind):
 
 
 @pytest.mark.parametrize(
-    "error", [ConfigError("缺少 sk-secret"), ChatAPIError("HTTP 500 sk-secret")]
+    "error",
+    [ConfigError("缺少 sk-secret"), ChatAPIError("sk-secret", status_code=500)],
 )
 async def test_model_and_config_errors_send_generic_message(
     app: App, runtime, caplog, error
@@ -374,6 +375,8 @@ async def test_model_and_config_errors_send_generic_message(
     assert runtime.record.await_count == 1
     assert "sk-secret" not in caplog.text
     assert "Traceback" not in caplog.text
+    if isinstance(error, ChatAPIError) and error.status_code is not None:
+        assert f"HTTP {error.status_code}" in caplog.text
 
 
 async def test_probability_query_is_superuser_only_and_uses_one_decimal(app: App, runtime):

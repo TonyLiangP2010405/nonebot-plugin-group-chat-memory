@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import math
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -11,6 +12,7 @@ from .context import build_chat_messages
 from .models import ChatContext
 
 CHAT_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0)
+CLIENT_USER_AGENT = "nonebot-plugin-group-chat-memory/0.1.2"
 
 
 class ModelAPIError(RuntimeError):
@@ -24,9 +26,16 @@ class EmbeddingAPIError(ModelAPIError):
 class ChatAPIError(ModelAPIError):
     """聊天请求失败或响应不可用。"""
 
-    def __init__(self, message: str, *, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        status_code: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.status_code = status_code
 
 
 def _make_client(timeout: float) -> httpx.AsyncClient:
@@ -39,7 +48,19 @@ def _endpoint(base_url: str, path: str) -> str:
 
 
 def _auth_headers(api_key: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {api_key.strip()}"}
+    return {
+        "Authorization": f"Bearer {api_key.strip()}",
+        "User-Agent": CLIENT_USER_AGENT,
+    }
+
+
+def _chat_headers(
+    base_url: str, api_key: str, session_id: str | None
+) -> dict[str, str]:
+    headers = _auth_headers(api_key)
+    if session_id and urlparse(base_url).hostname == "opencode.ai":
+        headers["x-opencode-session"] = session_id
+    return headers
 
 
 class EmbeddingClient:
@@ -105,7 +126,9 @@ class ChatClient:
         self._config = config
         self._retry_delays = tuple(retry_delays)
 
-    async def complete(self, context: ChatContext, current_text: str) -> str:
+    async def complete(
+        self, context: ChatContext, current_text: str, *, session_id: str | None = None
+    ) -> str:
         """按上下文请求一条回复；瞬时失败按配置次数重试，最终失败抛出 ChatAPIError。"""
         self._config.require_chat_config()
         if not current_text.strip():
@@ -118,7 +141,7 @@ class ChatClient:
         attempts = len(self._retry_delays) + 1
         for attempt in range(attempts):
             try:
-                response = await self._post(payload)
+                response = await self._post(payload, session_id)
             except ChatAPIError as exc:
                 if not exc.retryable or attempt + 1 >= attempts:
                     raise
@@ -127,9 +150,16 @@ class ChatClient:
             return self._parse(response)
         raise ChatAPIError("聊天请求重试次数已用尽。")
 
-    async def _post(self, payload: dict[str, Any]) -> httpx.Response:
-        url = _endpoint(self._config.group_chat_memory_chat_base_url, "chat/completions")
-        headers = _auth_headers(self._config.group_chat_memory_chat_api_key.get_secret_value())
+    async def _post(
+        self, payload: dict[str, Any], session_id: str | None
+    ) -> httpx.Response:
+        base_url = self._config.group_chat_memory_chat_base_url
+        url = _endpoint(base_url, "chat/completions")
+        headers = _chat_headers(
+            base_url,
+            self._config.group_chat_memory_chat_api_key.get_secret_value(),
+            session_id,
+        )
         timeout = self._config.group_chat_memory_chat_timeout
         try:
             async with _make_client(timeout) as client:
@@ -142,6 +172,7 @@ class ChatClient:
             raise ChatAPIError(
                 f"聊天服务返回 HTTP {response.status_code}。",
                 retryable=response.status_code == 429 or response.status_code >= 500,
+                status_code=response.status_code,
             )
         return response
 

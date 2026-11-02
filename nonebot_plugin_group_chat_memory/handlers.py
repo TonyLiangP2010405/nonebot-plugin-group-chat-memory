@@ -21,7 +21,7 @@ from nonebot.adapters.onebot.v11 import (
 from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
 
-from .api import ChatClient, EmbeddingClient
+from .api import ChatAPIError, ChatClient, EmbeddingClient
 from .config import get_settings
 from .context import ContextBuilder
 from .memory import MemoryWriter
@@ -79,9 +79,12 @@ async def reply(group_id: int, message: MemoryMessage) -> None:
     bot = _bots[group_id]
     try:
         context = await context_builder.build(group_id, message.text)
-        response = await chat_client.complete(context, message.text)
+        response = await chat_client.complete(
+            context, message.text, session_id=f"group:{group_id}"
+        )
     except Exception as exc:
-        logger.error("群 %s 的聊天回复失败：%s", group_id, type(exc).__name__)
+        status = f" HTTP {exc.status_code}" if isinstance(exc, ChatAPIError) else ""
+        logger.error("群 %s 的聊天回复失败：%s%s", group_id, type(exc).__name__, status)
         await bot.send_group_msg(group_id=group_id, message=GENERIC_REPLY_ERROR)
         return
 

@@ -255,6 +255,34 @@ class TestEmbeddingClient:
 
 
 class TestChatClient:
+    async def test_opencode_requests_identify_client_and_session(self):
+        config = make_config(
+            group_chat_memory_chat_base_url="https://opencode.ai/inference/go/openai/v1"
+        )
+        url = "https://opencode.ai/inference/go/openai/v1/chat/completions"
+        with respx.mock(assert_all_called=False) as mock:
+            route = mock.post(url).mock(return_value=chat_response("ok"))
+
+            answer = await ChatClient(config).complete(
+                make_context(), "在吗", session_id="group:100"
+            )
+
+        assert answer == "ok"
+        request = route.calls[0].request
+        assert request.headers["User-Agent"] == "nonebot-plugin-group-chat-memory/0.1.2"
+        assert request.headers["x-opencode-session"] == "group:100"
+
+    async def test_non_opencode_provider_does_not_receive_session_header(self, config):
+        with respx.mock(assert_all_called=False) as mock:
+            route = mock.post(CHAT_URL).mock(return_value=chat_response("ok"))
+
+            await ChatClient(config).complete(make_context(), "在吗", session_id="group:100")
+
+        assert "x-opencode-session" not in route.calls[0].request.headers
+        assert route.calls[0].request.headers["User-Agent"].startswith(
+            "nonebot-plugin-group-chat-memory/"
+        )
+
     async def test_sends_context_and_returns_stripped_content(self, config):
         with respx.mock(assert_all_called=False) as mock:
             route = mock.post(CHAT_URL).mock(return_value=chat_response(" 你好呀 "))
