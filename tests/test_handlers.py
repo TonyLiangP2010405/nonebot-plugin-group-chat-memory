@@ -239,20 +239,19 @@ async def test_empty_directed_message_does_not_call_model_or_record(app: App, ru
     runtime.complete.assert_not_awaited()
 
 
-async def test_reply_to_another_user_is_not_directed_or_recorded(app: App, runtime):
+async def test_reply_to_another_user_is_recorded_without_random_reply(app: App, runtime):
     runtime.get_probability.return_value = 100.0
     reply = bot_reply()
     reply.sender.user_id = USER_ID
-    event = make_group_event(
-        Message([MessageSegment.reply(99), MessageSegment.text("回复别人")]), reply=reply
-    )
+    event = make_group_event("回复别人", reply=reply)
 
     async with app.test_matcher() as ctx:
         bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
         ctx.receive_event(bot, event)
         await ctx.run()
 
-    runtime.record.assert_not_awaited()
+    runtime.record.assert_awaited_once()
+    assert runtime.record.await_args.args[0].text == "回复别人"
     runtime.complete.assert_not_awaited()
     runtime.get_probability.assert_not_awaited()
 
@@ -456,16 +455,18 @@ async def test_lifecycle_startup_and_shutdown_order(runtime, monkeypatch):
     assert calls == [
         "open",
         "start",
-        "coordinator",
         "flush:5",
         "writer close",
+        "coordinator",
         "store close",
     ]
 
 
 async def test_shutdown_closes_resources_after_flush_timeout(runtime, monkeypatch):
     calls: list[str] = []
-    monkeypatch.setattr(runtime.coordinator, "close", AsyncMock())
+    monkeypatch.setattr(
+        runtime.coordinator, "close", AsyncMock(side_effect=lambda: calls.append("coordinator"))
+    )
     monkeypatch.setattr(handlers.writer, "flush", AsyncMock(side_effect=asyncio.TimeoutError))
     monkeypatch.setattr(
         handlers.writer, "close", AsyncMock(side_effect=lambda: calls.append("writer"))
@@ -477,4 +478,39 @@ async def test_shutdown_closes_resources_after_flush_timeout(runtime, monkeypatc
     await handlers.shutdown()
 
     handlers.writer.flush.assert_awaited_once_with(timeout=5)
-    assert calls == ["writer", "store"]
+    assert calls == ["writer", "coordinator", "store"]
+
+
+@pytest.mark.parametrize("failing", ["writer", "coordinator"])
+async def test_shutdown_continues_cleanup_after_close_failure(runtime, monkeypatch, failing):
+    calls: list[str] = []
+
+    async def close_writer() -> None:
+        calls.append("writer")
+        if failing == "writer":
+            raise RuntimeError("writer failed")
+
+    async def close_coordinator() -> None:
+        calls.append("coordinator")
+        if failing == "coordinator":
+            raise RuntimeError("coordinator failed")
+
+    monkeypatch.setattr(
+        handlers,
+        "coordinator",
+        SimpleNamespace(close=AsyncMock(side_effect=close_coordinator)),
+    )
+    monkeypatch.setattr(
+        handlers.writer,
+        "flush",
+        AsyncMock(side_effect=lambda *, timeout: calls.append("flush")),
+    )
+    monkeypatch.setattr(handlers.writer, "close", AsyncMock(side_effect=close_writer))
+    monkeypatch.setattr(
+        handlers.store, "close", AsyncMock(side_effect=lambda: calls.append("store"))
+    )
+
+    with pytest.raises(RuntimeError, match=f"{failing} failed"):
+        await handlers.shutdown()
+
+    assert calls == ["flush", "writer", "coordinator", "store"]

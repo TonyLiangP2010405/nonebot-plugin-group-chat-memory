@@ -41,14 +41,19 @@ async def startup() -> None:
 
 
 async def shutdown() -> None:
-    await coordinator.close()
     try:
-        await writer.flush(timeout=5)
-    except asyncio.TimeoutError:
-        logger.warning("关闭插件时等待记忆写入超时，将保留未完成数据供下次启动恢复。")
+        try:
+            try:
+                await writer.flush(timeout=5)
+            except asyncio.TimeoutError:
+                logger.warning("关闭插件时等待记忆写入超时，将保留未完成数据供下次启动恢复。")
+        finally:
+            await writer.close()
     finally:
-        await writer.close()
-        await store.close()
+        try:
+            await coordinator.close()
+        finally:
+            await store.close()
 
 
 async def reply(group_id: int, message: MemoryMessage) -> None:
@@ -146,7 +151,7 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     await writer.record(memory_message)
     if directed:
         coordinator.submit(event.group_id, memory_message, explicit=True)
-    elif await coordinator.should_random_reply(event.group_id):
+    elif event.reply is None and await coordinator.should_random_reply(event.group_id):
         coordinator.submit(event.group_id, memory_message, explicit=False)
 
 
