@@ -33,15 +33,23 @@ class TestConfigDefaults:
         assert config.group_chat_memory_ignored_qq == set()
         assert config.group_chat_memory_db_path_override is None
 
-    def test_default_system_prompt_is_mantou_with_kuroneko_personality(self):
+    def test_default_system_prompt_is_mantou_with_group_member_style(self):
         prompt = Config().group_chat_memory_system_prompt
 
         assert "馒头" in prompt
-        assert "凡人" in prompt
-        assert "夜魔女王" in prompt
-        assert "绝不自称“黑猫”" in prompt
+        assert "群友" in prompt
+        assert "确实" in prompt
+        assert "坏了" in prompt
+        assert "何意味" in prompt
+        assert "二十字以内" in prompt
         assert "准确" in prompt
         assert "安全" in prompt
+
+    def test_default_system_prompt_drops_kuroneko_persona(self):
+        prompt = Config().group_chat_memory_system_prompt
+
+        for retired in ("五更琉璃", "黑猫", "夜魔女王", "凡人", "中二"):
+            assert retired not in prompt
 
     def test_ignores_unrelated_nonebot_fields(self):
         config = Config(superusers={"10001"}, driver="~fastapi")

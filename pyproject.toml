@@ -1,6 +1,6 @@
 [project]
 name = "nonebot-plugin-group-chat-memory"
-version = "0.1.4"
+version = "0.1.5"
 description = "为 NoneBot2 群聊提供共享长期记忆、点名对话和按群概率回复"
 readme = "README.md"
 authors = [{ name = "TonyLiangP2010405" }]
