@@ -5,9 +5,11 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import nonebot
 import pytest
 import pytest_asyncio
 from nonebot.adapters.onebot.v11 import (
+    Adapter,
     Bot,
     GroupMessageEvent,
     Message,
@@ -15,6 +17,7 @@ from nonebot.adapters.onebot.v11 import (
     PrivateMessageEvent,
 )
 from nonebot.adapters.onebot.v11.event import Anonymous, Reply, Sender
+from nonebot.message import handle_event
 from nonebug import App
 
 from nonebot_plugin_group_chat_memory import handlers
@@ -686,7 +689,17 @@ async def test_setting_command_rejects_empty_argument(app: App, runtime, monkeyp
     setter.assert_not_awaited()
 
 
-@pytest.mark.parametrize("url", ["ftp://example.com", "https:///missing-host", "not-a-url"])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "ftp://example.com",
+        "https:///missing-host",
+        "not-a-url",
+        "https://exa mple.com/v1",
+        "https://example.com:bad/v1",
+        "http://[::1/v1",
+    ],
+)
 async def test_chat_url_must_be_http_or_https_with_host(app: App, runtime, monkeypatch, url):
     setter = AsyncMock()
     monkeypatch.setattr(handlers.store, "set_runtime_config", setter)
@@ -743,3 +756,77 @@ async def test_failed_setting_write_preserves_running_config(runtime, monkeypatc
         await handlers.apply_setting("chat_model", "new-model")
 
     assert handlers.config.group_chat_memory_chat_model == "old-model"
+
+
+@pytest.mark.parametrize(
+    ("command", "secret"),
+    [
+        ("/设置聊天密钥 chat-log-secret", "chat-log-secret"),
+        ("/设置向量密钥 embedding-log-secret", "embedding-log-secret"),
+    ],
+)
+async def test_secret_commands_are_redacted_from_event_logs(
+    runtime, monkeypatch, command, secret
+):
+    monkeypatch.setattr(handlers.store, "set_runtime_config", AsyncMock())
+    event = make_private_event(content=command, user_id=SUPERUSER_ID)
+    messages: list[str] = []
+    sink_id = handlers.nonebot_logger.add(lambda message: messages.append(str(message)))
+    try:
+        bot = Bot(nonebot.get_adapter(Adapter), str(BOT_ID))
+        bot.send = AsyncMock()
+        await handle_event(bot, event)
+    finally:
+        handlers.nonebot_logger.remove(sink_id)
+
+    logs = "".join(messages)
+    assert secret not in logs
+    assert "****" in logs
+
+
+async def test_concurrent_settings_keep_memory_consistent_with_database(
+    runtime, monkeypatch
+):
+    saved: dict[str, str] = {}
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def set_runtime_config(key: str, value: str) -> None:
+        if key == "chat_base_url":
+            first_started.set()
+            await release_first.wait()
+        saved[key] = value
+
+    monkeypatch.setattr(handlers.store, "set_runtime_config", set_runtime_config)
+    first = asyncio.create_task(
+        handlers.apply_setting("chat_base_url", "https://new.example/v1")
+    )
+    await first_started.wait()
+    second = asyncio.create_task(handlers.apply_setting("chat_model", "new-model"))
+    release_first.set()
+    await asyncio.gather(first, second)
+
+    assert saved == {
+        "chat_base_url": "https://new.example/v1",
+        "chat_model": "new-model",
+    }
+    assert handlers.config.group_chat_memory_chat_base_url == saved["chat_base_url"]
+    assert handlers.config.group_chat_memory_chat_model == saved["chat_model"]
+
+
+async def test_concurrent_updates_to_same_field_match_final_database_value(
+    runtime, monkeypatch
+):
+    saved: dict[str, str] = {}
+
+    async def set_runtime_config(key: str, value: str) -> None:
+        await asyncio.sleep(0)
+        saved[key] = value
+
+    monkeypatch.setattr(handlers.store, "set_runtime_config", set_runtime_config)
+    await asyncio.gather(
+        handlers.apply_setting("chat_model", "model-a"),
+        handlers.apply_setting("chat_model", "model-b"),
+    )
+
+    assert handlers.config.group_chat_memory_chat_model == saved["chat_model"]

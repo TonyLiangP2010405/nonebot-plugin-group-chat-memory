@@ -6,8 +6,10 @@ import re
 from datetime import datetime, timezone
 from typing import Annotated
 from urllib.parse import urlparse
+from weakref import WeakKeyDictionary
 
 from nonebot import get_driver, on_command, on_message
+from nonebot import logger as nonebot_logger
 from nonebot.adapters.onebot.v11 import (
     Bot,
     GroupMessageEvent,
@@ -33,6 +35,14 @@ GENERIC_REPLY_ERROR = "暂时无法生成回复，请稍后再试。"
 PERMISSION_DENIED = "仅 SUPERUSER 可执行此命令。"
 INVALID_PROBABILITY = "概率需为 0～100 的数字，最多一位小数。"
 PROBABILITY_PATTERN = re.compile(r"(?:100(?:\.0)?|\d{1,2}(?:\.\d)?)")
+SECRET_COMMAND_LOG_PATTERN = re.compile(r"(设置聊天密钥|设置向量密钥)\s+[^\r\n]*")
+
+
+def _redact_secret_command_logs(record) -> None:
+    record["message"] = SECRET_COMMAND_LOG_PATTERN.sub(r"\1 ****", record["message"])
+
+
+nonebot_logger.configure(patcher=_redact_secret_command_logs)
 
 config = get_settings()
 store = MemoryStore(config)
@@ -100,16 +110,28 @@ async def _eligible_group_message(bot: Bot, event: GroupMessageEvent) -> bool:
     return event.user_id not in config.group_chat_memory_ignored_qq
 
 
+settings_locks: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = WeakKeyDictionary()
+
+
+def _settings_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    if (lock := settings_locks.get(loop)) is None:
+        lock = asyncio.Lock()
+        settings_locks[loop] = lock
+    return lock
+
+
 async def apply_setting(key: str, value: str) -> None:
-    values = {
-        "chat_base_url": config.group_chat_memory_chat_base_url,
-        "chat_api_key": config.group_chat_memory_chat_api_key.get_secret_value(),
-        "chat_model": config.group_chat_memory_chat_model,
-        "embedding_api_key": config.group_chat_memory_embedding_api_key.get_secret_value(),
-    }
-    values[key] = value
-    await store.set_runtime_config(key, value)
-    config.apply_runtime_config(values)
+    async with _settings_lock():
+        values = {
+            "chat_base_url": config.group_chat_memory_chat_base_url,
+            "chat_api_key": config.group_chat_memory_chat_api_key.get_secret_value(),
+            "chat_model": config.group_chat_memory_chat_model,
+            "embedding_api_key": config.group_chat_memory_embedding_api_key.get_secret_value(),
+        }
+        values[key] = value
+        await store.set_runtime_config(key, value)
+        config.apply_runtime_config(values)
 
 
 chat_url_matcher = on_command("设置聊天地址", priority=5, block=True)
@@ -117,6 +139,22 @@ chat_key_matcher = on_command("设置聊天密钥", priority=5, block=True)
 chat_model_matcher = on_command("设置聊天模型", priority=5, block=True)
 embedding_key_matcher = on_command("设置向量密钥", priority=5, block=True)
 model_config_matcher = on_command("模型配置", priority=5, block=True)
+
+
+def _valid_http_url(value: str) -> bool:
+    if any(
+        character.isspace() or ord(character) < 32 or ord(character) == 127
+        for character in value
+    ):
+        return False
+    try:
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return False
+        _ = parsed.port
+    except ValueError:
+        return False
+    return True
 
 
 async def _handle_setting(matcher, bot: Bot, event: MessageEvent, args: Message, key: str) -> None:
@@ -128,10 +166,8 @@ async def _handle_setting(matcher, bot: Bot, event: MessageEvent, args: Message,
     value = args.extract_plain_text().strip()
     if not value:
         await matcher.finish("配置参数不能为空。")
-    if key == "chat_base_url":
-        parsed = urlparse(value)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            await matcher.finish("聊天 API 地址需为有效的 http(s) URL。")
+    if key == "chat_base_url" and not _valid_http_url(value):
+        await matcher.finish("聊天 API 地址需为有效的 http(s) URL。")
     try:
         await apply_setting(key, value)
     except Exception as exc:
