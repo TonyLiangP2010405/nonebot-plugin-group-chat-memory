@@ -79,6 +79,7 @@ class MemoryWriter:
         self._closing = False
         self._stop_event.clear()
         self._recovered.clear()
+        self._queued_wakes.clear()
         task = asyncio.create_task(self._run(), name="group-chat-memory-writer")
         self._task = task
         task.add_done_callback(self._on_task_done)
@@ -186,10 +187,11 @@ class MemoryWriter:
             while True:
                 item = await self._queue.get()
                 try:
+                    if isinstance(item, _Wake):
+                        self._queued_wakes.discard(item.group_id)
                     if isinstance(item, _Stop) or self._closing:
                         return
                     if isinstance(item, _Wake):
-                        self._queued_wakes.discard(item.group_id)
                         await self._chunk_group(item.group_id)
                     else:
                         await self._embed_chunk(item)

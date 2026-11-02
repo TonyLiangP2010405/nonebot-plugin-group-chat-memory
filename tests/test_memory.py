@@ -602,6 +602,43 @@ class TestLostWakes:
         assert await second.store.pending_chunks() == []
         assert await second.store.pending_groups(10) == []
 
+    async def test_wake_queued_during_close_is_recovered_after_restart(self, harness):
+        embedding = FakeEmbedding()
+        embedding.gate = asyncio.Event()
+        writer = harness.writer(embedding)
+        writer.start()
+        await record_many(writer, 100, 10)
+        await asyncio.wait_for(embedding.entered.wait(), 1.0)
+
+        await writer.record(make_message(100, "消息10", index=10))
+        assert writer._queued_wakes == {100}
+
+        close_task = asyncio.create_task(writer.close())
+        await wait_until(lambda: writer._closing)
+        embedding.gate.set()
+        await asyncio.wait_for(close_task, 1.0)
+
+        assert count_rows(harness.path, 100) == {
+            "messages": 11,
+            "chunks": 1,
+            "memory_vectors": 1,
+        }
+
+        writer.start()
+        await asyncio.wait_for(writer.flush(), 1.0)
+        await record_many(writer, 100, 10, start=11)
+        await asyncio.wait_for(writer.flush(), 1.0)
+
+        assert len(embedding.calls) == 2
+        assert count_rows(harness.path, 100) == {
+            "messages": 21,
+            "chunks": 2,
+            "memory_vectors": 2,
+        }
+        assert writer._queued_wakes == set()
+        assert await harness.store.pending_chunks() == []
+        assert await harness.store.pending_groups(10) == []
+
 
 class TestClearGroup:
     async def test_clear_during_inflight_embedding_leaves_no_vectors(self, harness):
