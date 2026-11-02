@@ -5,9 +5,17 @@ import logging
 import re
 from datetime import datetime, timezone
 from typing import Annotated
+from urllib.parse import urlparse
 
 from nonebot import get_driver, on_command, on_message
-from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, MessageSegment
+from nonebot.adapters.onebot.v11 import (
+    Bot,
+    GroupMessageEvent,
+    Message,
+    MessageEvent,
+    MessageSegment,
+    PrivateMessageEvent,
+)
 from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
 
@@ -90,6 +98,91 @@ async def _eligible_group_message(bot: Bot, event: GroupMessageEvent) -> bool:
     if event.user_id in {event.self_id, int(bot.self_id)}:
         return False
     return event.user_id not in config.group_chat_memory_ignored_qq
+
+
+async def apply_setting(key: str, value: str) -> None:
+    values = {
+        "chat_base_url": config.group_chat_memory_chat_base_url,
+        "chat_api_key": config.group_chat_memory_chat_api_key.get_secret_value(),
+        "chat_model": config.group_chat_memory_chat_model,
+        "embedding_api_key": config.group_chat_memory_embedding_api_key.get_secret_value(),
+    }
+    values[key] = value
+    await store.set_runtime_config(key, value)
+    config.apply_runtime_config(values)
+
+
+chat_url_matcher = on_command("设置聊天地址", priority=5, block=True)
+chat_key_matcher = on_command("设置聊天密钥", priority=5, block=True)
+chat_model_matcher = on_command("设置聊天模型", priority=5, block=True)
+embedding_key_matcher = on_command("设置向量密钥", priority=5, block=True)
+model_config_matcher = on_command("模型配置", priority=5, block=True)
+
+
+async def _handle_setting(matcher, bot: Bot, event: MessageEvent, args: Message, key: str) -> None:
+    if not isinstance(event, PrivateMessageEvent):
+        await matcher.finish("请在私聊中设置模型配置。")
+    if not await SUPERUSER(bot, event):
+        await matcher.finish(PERMISSION_DENIED)
+
+    value = args.extract_plain_text().strip()
+    if not value:
+        await matcher.finish("配置参数不能为空。")
+    if key == "chat_base_url":
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            await matcher.finish("聊天 API 地址需为有效的 http(s) URL。")
+    try:
+        await apply_setting(key, value)
+    except Exception as exc:
+        logger.error("保存模型配置失败：%s", type(exc).__name__)
+        await matcher.finish("配置保存失败，请稍后再试。")
+    await matcher.finish("模型配置已更新。")
+
+
+@chat_url_matcher.handle()
+async def handle_chat_url(
+    bot: Bot, event: MessageEvent, args: Annotated[Message, CommandArg()]
+) -> None:
+    await _handle_setting(chat_url_matcher, bot, event, args, "chat_base_url")
+
+
+@chat_key_matcher.handle()
+async def handle_chat_key(
+    bot: Bot, event: MessageEvent, args: Annotated[Message, CommandArg()]
+) -> None:
+    await _handle_setting(chat_key_matcher, bot, event, args, "chat_api_key")
+
+
+@chat_model_matcher.handle()
+async def handle_chat_model(
+    bot: Bot, event: MessageEvent, args: Annotated[Message, CommandArg()]
+) -> None:
+    await _handle_setting(chat_model_matcher, bot, event, args, "chat_model")
+
+
+@embedding_key_matcher.handle()
+async def handle_embedding_key(
+    bot: Bot, event: MessageEvent, args: Annotated[Message, CommandArg()]
+) -> None:
+    await _handle_setting(embedding_key_matcher, bot, event, args, "embedding_api_key")
+
+
+@model_config_matcher.handle()
+async def handle_model_config(bot: Bot, event: MessageEvent) -> None:
+    if not await SUPERUSER(bot, event):
+        await model_config_matcher.finish(PERMISSION_DENIED)
+
+    def status(secret: str) -> str:
+        return "已配置（****）" if secret else "未配置"
+
+    await model_config_matcher.finish(
+        f"聊天地址：{config.group_chat_memory_chat_base_url or '未配置'}\n"
+        f"聊天模型：{config.group_chat_memory_chat_model}\n"
+        f"聊天密钥：{status(config.group_chat_memory_chat_api_key.get_secret_value())}\n"
+        "Embedding 密钥："
+        f"{status(config.group_chat_memory_embedding_api_key.get_secret_value())}"
+    )
 
 
 probability_matcher = on_command(

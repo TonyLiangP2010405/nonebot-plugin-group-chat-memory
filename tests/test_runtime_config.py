@@ -1,8 +1,9 @@
+from __future__ import annotations
+
 import pytest
 
 from nonebot_plugin_group_chat_memory.config import Config, ConfigError
 from nonebot_plugin_group_chat_memory.store import MemoryStore
-
 
 RUNTIME_VALUES = {
     "chat_base_url": "https://chat.example.com/v1",

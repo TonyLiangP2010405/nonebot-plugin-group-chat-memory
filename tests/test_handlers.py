@@ -62,8 +62,10 @@ def make_group_event(
     )
 
 
-def make_private_event(sub_type: str) -> PrivateMessageEvent:
-    message = Message("私聊")
+def make_private_event(
+    sub_type: str = "friend", *, content: str = "私聊", user_id: int = USER_ID
+) -> PrivateMessageEvent:
+    message = Message(content)
     return PrivateMessageEvent(
         time=1_700_000_000,
         self_id=BOT_ID,
@@ -71,12 +73,12 @@ def make_private_event(sub_type: str) -> PrivateMessageEvent:
         message_type="private",
         sub_type=sub_type,
         message_id=1,
-        user_id=USER_ID,
+        user_id=user_id,
         message=message,
         original_message=message,
-        raw_message="私聊",
+        raw_message=content,
         font=0,
-        sender=Sender(user_id=USER_ID, nickname="昵称"),
+        sender=Sender(user_id=user_id, nickname="昵称"),
     )
 
 
@@ -115,6 +117,15 @@ async def runtime(monkeypatch):
     monkeypatch.setattr(handlers.store, "clear_group", clear_group)
     coordinator = ReplyCoordinator(handlers.store, handlers.reply)
     monkeypatch.setattr(handlers, "coordinator", coordinator)
+    saved_config = {
+        field: getattr(handlers.config, field)
+        for field in (
+            "group_chat_memory_chat_base_url",
+            "group_chat_memory_chat_api_key",
+            "group_chat_memory_chat_model",
+            "group_chat_memory_embedding_api_key",
+        )
+    }
     handlers._bots.clear()
     try:
         yield SimpleNamespace(
@@ -128,6 +139,8 @@ async def runtime(monkeypatch):
         )
     finally:
         await coordinator.close()
+        for field, value in saved_config.items():
+            setattr(handlers.config, field, value)
         handlers._bots.clear()
 
 
@@ -572,3 +585,161 @@ async def test_shutdown_continues_cleanup_after_close_failure(runtime, monkeypat
         await handlers.shutdown()
 
     assert calls == ["flush", "writer", "coordinator", "store"]
+
+
+@pytest.mark.parametrize(
+    ("command", "key", "value", "field"),
+    [
+        (
+            "/设置聊天地址 https://chat.example.com/v1",
+            "chat_base_url",
+            "https://chat.example.com/v1",
+            "group_chat_memory_chat_base_url",
+        ),
+        (
+            "/设置聊天密钥 chat-secret",
+            "chat_api_key",
+            "chat-secret",
+            "group_chat_memory_chat_api_key",
+        ),
+        (
+            "/设置聊天模型 deepseek-v4.1-flash",
+            "chat_model",
+            "deepseek-v4.1-flash",
+            "group_chat_memory_chat_model",
+        ),
+        (
+            "/设置向量密钥 embedding-secret",
+            "embedding_api_key",
+            "embedding-secret",
+            "group_chat_memory_embedding_api_key",
+        ),
+    ],
+)
+async def test_private_superuser_updates_runtime_config_immediately(
+    app: App, runtime, monkeypatch, command, key, value, field
+):
+    setter = AsyncMock()
+    monkeypatch.setattr(handlers.store, "set_runtime_config", setter)
+    event = make_private_event(content=command, user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, "模型配置已更新。", result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        await ctx.run()
+
+    setter.assert_awaited_once_with(key, value)
+    configured = getattr(handlers.config, field)
+    if hasattr(configured, "get_secret_value"):
+        configured = configured.get_secret_value()
+    assert configured == value
+    runtime.record.assert_not_awaited()
+    runtime.complete.assert_not_awaited()
+
+
+async def test_group_setting_command_is_rejected_without_memory(app: App, runtime, monkeypatch):
+    setter = AsyncMock()
+    monkeypatch.setattr(handlers.store, "set_runtime_config", setter)
+    event = make_group_event("/设置聊天密钥 group-secret", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, "请在私聊中设置模型配置。", result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        await ctx.run()
+
+    setter.assert_not_awaited()
+    runtime.record.assert_not_awaited()
+    runtime.complete.assert_not_awaited()
+
+
+async def test_private_non_superuser_cannot_update_config(app: App, runtime, monkeypatch):
+    setter = AsyncMock()
+    monkeypatch.setattr(handlers.store, "set_runtime_config", setter)
+    event = make_private_event(content="/设置聊天密钥 secret")
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, "仅 SUPERUSER 可执行此命令。", result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        await ctx.run()
+
+    setter.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["/设置聊天地址", "/设置聊天密钥", "/设置聊天模型", "/设置向量密钥"],
+)
+async def test_setting_command_rejects_empty_argument(app: App, runtime, monkeypatch, command):
+    setter = AsyncMock()
+    monkeypatch.setattr(handlers.store, "set_runtime_config", setter)
+    event = make_private_event(content=command, user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, "配置参数不能为空。", result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        await ctx.run()
+
+    setter.assert_not_awaited()
+
+
+@pytest.mark.parametrize("url", ["ftp://example.com", "https:///missing-host", "not-a-url"])
+async def test_chat_url_must_be_http_or_https_with_host(app: App, runtime, monkeypatch, url):
+    setter = AsyncMock()
+    monkeypatch.setattr(handlers.store, "set_runtime_config", setter)
+    event = make_private_event(content=f"/设置聊天地址 {url}", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, "聊天 API 地址需为有效的 http(s) URL。", result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        await ctx.run()
+
+    setter.assert_not_awaited()
+
+
+async def test_model_config_query_masks_both_secrets(app: App, runtime):
+    handlers.config.apply_runtime_config(
+        {
+            "chat_base_url": "https://chat.example.com/v1",
+            "chat_api_key": "chat-full-secret",
+            "chat_model": "deepseek-v4.1-flash",
+            "embedding_api_key": "embedding-full-secret",
+        }
+    )
+    event = make_group_event("/模型配置", user_id=SUPERUSER_ID)
+    response = (
+        "聊天地址：https://chat.example.com/v1\n"
+        "聊天模型：deepseek-v4.1-flash\n"
+        "聊天密钥：已配置（****）\n"
+        "Embedding 密钥：已配置（****）"
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, response, result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        await ctx.run()
+
+    runtime.record.assert_not_awaited()
+    assert "chat-full-secret" not in response
+    assert "embedding-full-secret" not in response
+
+
+async def test_failed_setting_write_preserves_running_config(runtime, monkeypatch):
+    handlers.config.apply_runtime_config({"chat_model": "old-model"})
+    monkeypatch.setattr(
+        handlers.store,
+        "set_runtime_config",
+        AsyncMock(side_effect=RuntimeError("database unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        await handlers.apply_setting("chat_model", "new-model")
+
+    assert handlers.config.group_chat_memory_chat_model == "old-model"

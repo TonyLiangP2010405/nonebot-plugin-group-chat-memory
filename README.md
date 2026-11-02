@@ -39,32 +39,32 @@ poetry add "nonebot2[fastapi]"
 
 ## 快速配置
 
-复制 `.env.example` 为 `.env`，至少填写聊天接口、聊天密钥和 Embedding 密钥，并设置 SUPERUSER：
+复制 `.env.example` 为 `.env` 并设置 SUPERUSER：
 
 ```dotenv
 SUPERUSERS=["10001"]
 COMMAND_START=["/"]
-
-GROUP_CHAT_MEMORY_CHAT_BASE_URL=https://your-chat-provider.example/v1
-GROUP_CHAT_MEMORY_CHAT_API_KEY=sk-your-chat-key
-GROUP_CHAT_MEMORY_CHAT_MODEL=your-provider-model-id
-GROUP_CHAT_MEMORY_EMBEDDING_API_KEY=sk-your-embedding-key
 ```
 
-`base_url` 填到 API 根路径（通常包含 `/v1`），插件分别请求其下的 `/chat/completions` 和 `/embeddings`。默认聊天模型标识是 `deepseek-v4.1-flash`，但**模型标识必须以实际服务商支持的值为准**；如果服务商没有该标识，必须修改 `GROUP_CHAT_MEMORY_CHAT_MODEL`。
+启动 Bot 后，由 SUPERUSER 在**私聊**中依次设置四项运行时配置：
 
-## 全部配置字段
+```text
+/设置聊天地址 https://your-chat-provider.example/v1
+/设置聊天密钥 sk-your-chat-key
+/设置聊天模型 your-provider-model-id
+/设置向量密钥 sk-your-embedding-key
+```
 
-以下字段都可写在 NoneBot `.env` 中；集合类值使用 JSON 格式。
+聊天地址填到 API 根路径（通常包含 `/v1`），插件分别请求其下的 `/chat/completions` 和 `/embeddings`。默认聊天模型标识是 `deepseek-v4.1-flash`，但**模型标识必须以实际服务商支持的值为准**。这四项保存到 SQLite，不再读取同名环境变量，更新后立即生效且重启后保留。使用 `/模型配置` 可查询脱敏状态。
+
+## 其余环境配置字段
+
+四个模型运行时字段不再通过 env 设置。其余以下字段可写在 NoneBot `.env` 中；集合类值使用 JSON 格式。
 
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
-| `GROUP_CHAT_MEMORY_CHAT_BASE_URL` | 空 | OpenAI 兼容聊天 API 根地址；实际聊天前必填。 |
-| `GROUP_CHAT_MEMORY_CHAT_API_KEY` | 空 | 聊天 API 密钥；实际聊天前必填，不会写入数据库。 |
-| `GROUP_CHAT_MEMORY_CHAT_MODEL` | `deepseek-v4.1-flash` | 聊天模型标识，按服务商实际支持值配置。 |
 | `GROUP_CHAT_MEMORY_CHAT_TIMEOUT` | `60` | 单次聊天 HTTP 请求超时秒数，必须大于 0。 |
 | `GROUP_CHAT_MEMORY_EMBEDDING_BASE_URL` | `https://api.siliconflow.cn/v1` | OpenAI 兼容 Embedding API 根地址。 |
-| `GROUP_CHAT_MEMORY_EMBEDDING_API_KEY` | 空 | Embedding API 密钥；实际向量化前必填。 |
 | `GROUP_CHAT_MEMORY_EMBEDDING_MODEL` | `BAAI/bge-m3` | Embedding 模型标识。 |
 | `GROUP_CHAT_MEMORY_EMBEDDING_DIMENSIONS` | `1024` | 向量维度，必须大于 0，必须与模型及既有数据库一致。 |
 | `GROUP_CHAT_MEMORY_EMBEDDING_TIMEOUT` | `10` | 后台分块 Embedding HTTP 请求超时秒数，必须大于 0。 |
@@ -86,11 +86,16 @@ GROUP_CHAT_MEMORY_EMBEDDING_API_KEY=sk-your-embedding-key
 
 | 命令 | 权限 | 行为 |
 |---|---|---|
+| `/设置聊天地址 <URL>` | 仅私聊 SUPERUSER | 设置全局 OpenAI 兼容聊天 API 根地址。 |
+| `/设置聊天密钥 <密钥>` | 仅私聊 SUPERUSER | 设置全局聊天 API 密钥。 |
+| `/设置聊天模型 <模型标识>` | 仅私聊 SUPERUSER | 设置全局聊天模型。 |
+| `/设置向量密钥 <密钥>` | 仅私聊 SUPERUSER | 设置全局 Embedding API 密钥。 |
+| `/模型配置` | SUPERUSER，私聊或群聊 | 查询全局配置状态，密钥只显示掩码。 |
 | `/回复概率` | 仅 SUPERUSER | 查询当前群概率，显示一位小数。 |
 | `/回复概率 <0～100>` | 仅 SUPERUSER | 设置当前群概率，最多一位小数，例如 `/回复概率 5.5`。 |
 | `/清空群记忆` | 仅 SUPERUSER | 删除当前群原始消息、分块和向量；保留当前群概率，不影响其他群。 |
 
-非 SUPERUSER 会收到简短权限提示。命令仅在群聊中生效，不进入记忆，也不触发随机回复。SUPERUSER 通过 NoneBot 的 `SUPERUSERS` 配置，而不是群管理员身份确定。
+非 SUPERUSER 会收到简短权限提示。命令不进入记忆，也不触发随机回复。SUPERUSER 通过 NoneBot 的 `SUPERUSERS` 配置，而不是群管理员身份确定。
 
 同一群的模型请求串行执行：定向请求逐条排队；等待中的随机请求只保留最新一条，避免集中补发。不同群可以并行处理。
 
@@ -100,7 +105,7 @@ GROUP_CHAT_MEMORY_EMBEDDING_API_KEY=sk-your-embedding-key
 
 每积累 10 条消息（可由 `GROUP_CHAT_MEMORY_CHUNK_SIZE` 修改）形成的完整群聊片段会发送给配置的**第三方 Embedding 服务商**；每次回复前的当前查询文本也会发送给 Embedding 服务商。回复时，当前群最近消息、检索到的长期片段和当前输入会发送给聊天模型服务商。不同群的记忆和检索在数据库层面隔离，但同一群的成员内容可能进入该群后续模型上下文。
 
-原文与向量保存在本地 SQLite 文件中，数据库本身不加密。API 密钥只从环境变量或 NoneBot 配置读取，不写入数据库。请根据群成员授权、服务商数据政策和适用法律决定是否启用，并保护好数据库与备份。
+原文、向量与命令设置的 API 密钥保存在本地 SQLite 文件中，数据库本身不加密。请保护好数据库与备份，并限制文件访问权限。虽然设置密钥只允许私聊 SUPERUSER，但命令内容仍可能保留在你和 OneBot 协议端的聊天记录或日志中；不要把密钥发到群里，泄露后请立即更换。请根据群成员授权、服务商数据政策和适用法律决定是否启用。
 
 ## 缺失凭据与故障降级
 
