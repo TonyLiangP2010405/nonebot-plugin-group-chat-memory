@@ -138,11 +138,11 @@ async def apply_setting(key: str, value: str) -> None:
         config.apply_runtime_config(values)
 
 
-chat_url_matcher = on_command("设置聊天地址", priority=-1, block=True)
-chat_key_matcher = on_command("设置聊天密钥", priority=-1, block=True)
-chat_model_matcher = on_command("设置聊天模型", priority=-1, block=True)
-embedding_key_matcher = on_command("设置向量密钥", priority=-1, block=True)
-model_config_matcher = on_command("模型配置", priority=-1, block=True)
+chat_url_matcher = on_command("设置聊天地址", priority=-1001, block=True)
+chat_key_matcher = on_command("设置聊天密钥", priority=-1001, block=True)
+chat_model_matcher = on_command("设置聊天模型", priority=-1001, block=True)
+embedding_key_matcher = on_command("设置向量密钥", priority=-1001, block=True)
+model_config_matcher = on_command("模型配置", priority=-1001, block=True)
 
 
 def _valid_http_url(value: str) -> bool:
@@ -226,10 +226,12 @@ async def handle_model_config(bot: Bot, event: MessageEvent) -> None:
 
 
 probability_matcher = on_command(
-    "回复概率", rule=_eligible_group_message, priority=-1, block=True
+    "回复概率", rule=_eligible_group_message, priority=-1001, block=True
 )
-clear_matcher = on_command("清空群记忆", rule=_eligible_group_message, priority=-1, block=True)
-group_message_matcher = on_message(rule=_eligible_group_message, priority=0, block=False)
+clear_matcher = on_command(
+    "清空群记忆", rule=_eligible_group_message, priority=-1001, block=True
+)
+group_message_matcher = on_message(rule=_eligible_group_message, priority=-1000, block=False)
 
 
 @probability_matcher.handle()

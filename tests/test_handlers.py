@@ -837,14 +837,14 @@ async def test_concurrent_updates_to_same_field_match_final_database_value(
 
 
 def test_group_commands_and_chat_have_highest_priority():
-    assert handlers.probability_matcher.priority == -1
-    assert handlers.clear_matcher.priority == -1
-    assert handlers.chat_url_matcher.priority == -1
-    assert handlers.chat_key_matcher.priority == -1
-    assert handlers.chat_model_matcher.priority == -1
-    assert handlers.embedding_key_matcher.priority == -1
-    assert handlers.model_config_matcher.priority == -1
-    assert handlers.group_message_matcher.priority == 0
+    assert handlers.probability_matcher.priority == -1001
+    assert handlers.clear_matcher.priority == -1001
+    assert handlers.chat_url_matcher.priority == -1001
+    assert handlers.chat_key_matcher.priority == -1001
+    assert handlers.chat_model_matcher.priority == -1001
+    assert handlers.embedding_key_matcher.priority == -1001
+    assert handlers.model_config_matcher.priority == -1001
+    assert handlers.group_message_matcher.priority == -1000
 
 
 async def test_directed_message_stops_lower_priority_plugins(runtime, monkeypatch):
