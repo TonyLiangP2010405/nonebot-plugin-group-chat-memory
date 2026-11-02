@@ -17,6 +17,7 @@ from nonebot.adapters.onebot.v11 import (
     PrivateMessageEvent,
 )
 from nonebot.adapters.onebot.v11.event import Anonymous, Reply, Sender
+from nonebot.exception import StopPropagation
 from nonebot.message import handle_event
 from nonebug import App
 
@@ -833,3 +834,30 @@ async def test_concurrent_updates_to_same_field_match_final_database_value(
     )
 
     assert handlers.config.group_chat_memory_chat_model == saved["chat_model"]
+
+
+def test_group_commands_and_chat_have_highest_priority():
+    assert handlers.probability_matcher.priority == -1
+    assert handlers.clear_matcher.priority == -1
+    assert handlers.chat_url_matcher.priority == -1
+    assert handlers.chat_key_matcher.priority == -1
+    assert handlers.chat_model_matcher.priority == -1
+    assert handlers.embedding_key_matcher.priority == -1
+    assert handlers.model_config_matcher.priority == -1
+    assert handlers.group_message_matcher.priority == 0
+
+
+async def test_directed_message_stops_lower_priority_plugins(runtime, monkeypatch):
+    coordinator = SimpleNamespace(submit=MagicMock())
+    monkeypatch.setattr(handlers, "coordinator", coordinator)
+    event = make_group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text("点名")])
+    )
+    bot = Bot(nonebot.get_adapter(Adapter), str(BOT_ID))
+
+    with pytest.raises(StopPropagation):
+        await handlers.handle_group_message(bot, event)
+
+    runtime.record.assert_awaited_once()
+    coordinator.submit.assert_called_once()
+    assert coordinator.submit.call_args.kwargs["explicit"] is True

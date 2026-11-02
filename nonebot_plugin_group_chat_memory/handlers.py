@@ -18,6 +18,7 @@ from nonebot.adapters.onebot.v11 import (
     MessageSegment,
     PrivateMessageEvent,
 )
+from nonebot.exception import StopPropagation
 from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
 
@@ -137,11 +138,11 @@ async def apply_setting(key: str, value: str) -> None:
         config.apply_runtime_config(values)
 
 
-chat_url_matcher = on_command("设置聊天地址", priority=5, block=True)
-chat_key_matcher = on_command("设置聊天密钥", priority=5, block=True)
-chat_model_matcher = on_command("设置聊天模型", priority=5, block=True)
-embedding_key_matcher = on_command("设置向量密钥", priority=5, block=True)
-model_config_matcher = on_command("模型配置", priority=5, block=True)
+chat_url_matcher = on_command("设置聊天地址", priority=-1, block=True)
+chat_key_matcher = on_command("设置聊天密钥", priority=-1, block=True)
+chat_model_matcher = on_command("设置聊天模型", priority=-1, block=True)
+embedding_key_matcher = on_command("设置向量密钥", priority=-1, block=True)
+model_config_matcher = on_command("模型配置", priority=-1, block=True)
 
 
 def _valid_http_url(value: str) -> bool:
@@ -225,10 +226,10 @@ async def handle_model_config(bot: Bot, event: MessageEvent) -> None:
 
 
 probability_matcher = on_command(
-    "回复概率", rule=_eligible_group_message, priority=5, block=True
+    "回复概率", rule=_eligible_group_message, priority=-1, block=True
 )
-clear_matcher = on_command("清空群记忆", rule=_eligible_group_message, priority=5, block=True)
-group_message_matcher = on_message(rule=_eligible_group_message, priority=20, block=False)
+clear_matcher = on_command("清空群记忆", rule=_eligible_group_message, priority=-1, block=True)
+group_message_matcher = on_message(rule=_eligible_group_message, priority=0, block=False)
 
 
 @probability_matcher.handle()
@@ -288,6 +289,7 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     await writer.record(memory_message)
     if directed:
         coordinator.submit(event.group_id, memory_message, explicit=True)
+        raise StopPropagation
     elif (
         event.reply is None
         and all(segment.type == "text" for segment in event.message)
