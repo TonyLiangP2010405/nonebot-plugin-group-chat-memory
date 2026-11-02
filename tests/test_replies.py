@@ -517,3 +517,61 @@ class TestClose:
         coordinator.submit(100, make_message(100, "迟到"), True)
         await asyncio.sleep(0.05)
         assert reply.calls == []
+
+
+class TestCloseCancellationRace:
+    async def test_close_recovers_explicit_when_worker_cancelled_before_close(
+        self, make_coordinator, caplog
+    ):
+        reply = FakeReply(auto=True)
+        coordinator = make_coordinator(reply)
+        coordinator.submit(100, make_message(100, "一"), True)
+        coordinator.submit(100, make_message(100, "二", index=1), True)
+        coordinator.submit(100, make_message(100, "随机内容", index=2), False)
+
+        (worker,) = reply_workers()
+        worker.cancel()
+        # worker 已结束, 但它的 done callback 仍排在事件循环队列里. 直接 await close()
+        # 让 close 的同步前缀先于该 callback 执行, 固定"取消早于关闭"的交错.
+        await asyncio.sleep(0)
+        assert worker.done()
+        assert reply.calls == []
+
+        test_task = asyncio.current_task()
+        assert test_task is not None
+        watchdog = asyncio.get_running_loop().call_later(1.0, test_task.cancel)
+        try:
+            with caplog.at_level(logging.WARNING):
+                await coordinator.close()
+        finally:
+            watchdog.cancel()
+
+        assert reply.texts == ["一", "二"]
+        assert reply.completed == [(100, "一"), (100, "二")]
+        assert reply_workers() == set()
+        assert coordinator._groups == {}
+        assert "丢弃" in caplog.text
+        assert "随机内容" not in caplog.text
+
+    async def test_close_recovers_explicit_when_worker_cancelled_during_close(
+        self, make_coordinator
+    ):
+        reply = FakeReply()
+        coordinator = make_coordinator(reply)
+        coordinator.submit(100, make_message(100, "一"), True)
+        coordinator.submit(100, make_message(100, "二", index=1), True)
+        assert await reply.next_call() == (100, "一")
+
+        close_task = asyncio.create_task(coordinator.close())
+        await asyncio.sleep(0.01)
+        assert not close_task.done()
+
+        (worker,) = reply_workers()
+        worker.cancel()
+        assert await reply.next_call() == (100, "二")
+        reply.release(1)
+        await asyncio.wait_for(close_task, 1.0)
+
+        assert reply.completed == [(100, "二")]
+        assert reply_workers() == set()
+        assert coordinator._groups == {}

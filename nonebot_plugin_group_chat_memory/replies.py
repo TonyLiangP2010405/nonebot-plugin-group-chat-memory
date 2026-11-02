@@ -105,21 +105,40 @@ class ReplyCoordinator:
 
         已接受的 explicit（点名/回复）请求全部执行完毕才返回；等待中的随机请求
         被丢弃（只记录群号，不含正文），在途回复也会执行完毕，因此关闭后不会
-        遗留任何 worker 任务。可重复调用；调用方取消 `close()` 不会级联取消
-        worker，取消异常照常向上抛出，可再次调用完成收尾。
+        遗留任何 worker 或群状态。已结束 worker 的 done callback 可能仍在队列里
+        并因排队的点名请求拉起新 worker，所以这里循环等待到完全静默。
+        可重复调用；调用方取消 `close()` 不会级联取消 worker，取消异常照常向上
+        抛出，可再次调用完成收尾。
         """
         first = not self._closing
         self._closing = True
-        tasks: list[asyncio.Task[None]] = []
         for group_id, state in list(self._groups.items()):
             if first and state.discard_random():
                 logger.warning("回复协调器关闭，群 %s 的等待中的随机回复请求被丢弃。", group_id)
             state.wake.set()
-            task = state.task
-            if task is not None and not task.done():
-                tasks.append(task)
-        if tasks:
-            await asyncio.gather(*(asyncio.shield(task) for task in tasks), return_exceptions=True)
+        while True:
+            # 先让已结束 worker 的 done callback 执行: 它可能为排队的点名请求拉起新 worker.
+            await asyncio.sleep(0)
+            tasks = [
+                state.task
+                for state in self._groups.values()
+                if state.task is not None and not state.task.done()
+            ]
+            if tasks:
+                await asyncio.gather(
+                    *(asyncio.shield(task) for task in tasks), return_exceptions=True
+                )
+                continue
+            pending = [
+                (group_id, state) for group_id, state in self._groups.items() if state.explicit
+            ]
+            if not pending:
+                break
+            # 兜底: worker 的 done callback 尚未执行时, 由 close 自己续跑点名请求.
+            for group_id, state in pending:
+                state.wake.set()
+                self._ensure_worker(group_id, state)
+        self._groups.clear()
 
     def _ensure_worker(self, group_id: int, state: _GroupState) -> None:
         task = state.task
@@ -150,18 +169,25 @@ class ReplyCoordinator:
                 logger.exception("群 %s 的回复失败，已跳过该请求。", group_id)
 
     def _on_worker_done(self, group_id: int, state: _GroupState, task: asyncio.Task[None]) -> None:
-        if state.task is task:
-            state.task = None
-        if self._closing:
-            self._groups.pop(group_id, None)
-        elif state.has_pending():
-            # 回复被取消等异常结束 worker 时, 由监督回调立即续跑剩余请求.
-            state.wake.set()
-            self._ensure_worker(group_id, state)
         if task.cancelled():
             if not self._closing:
                 logger.warning("群 %s 的回复 worker 被取消。", group_id)
+        else:
+            error = task.exception()
+            if error is not None and not self._closing:
+                logger.error("群 %s 的回复 worker 意外退出：%r", group_id, error, exc_info=error)
+        if state.task is task:
+            state.task = None
+        if state.task is not None and not state.task.done():
             return
-        error = task.exception()
-        if error is not None and not self._closing:
-            logger.error("群 %s 的回复 worker 意外退出：%r", group_id, error, exc_info=error)
+        if self._needs_recovery(state):
+            state.wake.set()
+            self._ensure_worker(group_id, state)
+        elif self._closing:
+            self._groups.pop(group_id, None)
+
+    def _needs_recovery(self, state: _GroupState) -> bool:
+        """是否还有必须继续处理的请求: 关闭后仍要排空已接受的点名请求。"""
+        if state.explicit:
+            return True
+        return not self._closing and state.latest_random is not None
