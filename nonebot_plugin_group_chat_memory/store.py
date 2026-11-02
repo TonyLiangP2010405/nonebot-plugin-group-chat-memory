@@ -232,6 +232,21 @@ class MemoryStore:
             await cursor.close()
         return [_row_to_chunk(row) for row in rows]
 
+    async def pending_groups(self, size: int) -> list[int]:
+        """返回未分块消息数量至少为 size 的群，按群号升序。"""
+        if size < 1:
+            raise ValueError("分块大小必须至少为 1。")
+        async with self._lock:
+            db = self._require_db()
+            cursor = await db.execute(
+                "SELECT group_id FROM messages WHERE chunk_id IS NULL "
+                "GROUP BY group_id HAVING count(*) >= ? ORDER BY group_id",
+                (size,),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [int(row["group_id"]) for row in rows]
+
     async def complete_chunk(self, chunk_id: int, vector: list[float]) -> None:
         """写入片段向量并标记为 ready；片段已被清空时静默忽略。"""
         embedding = _validated_vector(vector, self._dimensions)

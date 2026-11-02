@@ -55,6 +55,14 @@ def count_rows(path: Path, group_id: int) -> dict[str, int]:
         connection.close()
 
 
+async def wait_until(predicate, timeout: float = 1.0) -> None:
+    async def poll() -> None:
+        while not predicate():
+            await asyncio.sleep(0.001)
+
+    await asyncio.wait_for(poll(), timeout)
+
+
 class FakeEmbedding:
     """可记录调用、可延迟、可失败的 Embedding 替身。"""
 
@@ -75,6 +83,21 @@ class FakeEmbedding:
         return [list(VECTOR) for _ in texts]
 
 
+class WorkerFatal(BaseException):
+    """模拟逃逸出 Exception 捕获的后台任务致命错误。"""
+
+
+class FatalEmbedding:
+    """Embedding 阶段抛出 BaseException，用于验证后台任务监督。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        self.calls += 1
+        raise WorkerFatal("模拟致命错误")
+
+
 class FailingStore:
     """记录消息写入必定失败的存储替身。"""
 
@@ -88,12 +111,46 @@ class FailingStore:
     async def pending_chunks(self) -> list:
         return []
 
+    async def pending_groups(self, size: int) -> list[int]:
+        return []
+
 
 class BrokenPendingStore:
-    """启动恢复时读取待处理片段失败的存储替身。"""
+    """启动恢复读取待处理记录失败的存储替身。"""
 
     async def pending_chunks(self) -> list:
         raise RuntimeError("数据库读取失败：disk I/O error")
+
+    async def pending_groups(self, size: int) -> list[int]:
+        raise RuntimeError("数据库读取失败：disk I/O error")
+
+
+class FlakyStore:
+    """包装真实存储，按次数让分块失败。"""
+
+    def __init__(self, store: MemoryStore, *, failures: int = 1) -> None:
+        self._store = store
+        self.failures = failures
+        self.chunk_attempts = 0
+
+    async def add_message(self, message: Message) -> int:
+        return await self._store.add_message(message)
+
+    async def pending_chunks(self) -> list:
+        return await self._store.pending_chunks()
+
+    async def pending_groups(self, size: int) -> list[int]:
+        return await self._store.pending_groups(size)
+
+    async def create_ready_chunk(self, group_id: int, size: int):
+        self.chunk_attempts += 1
+        if self.failures > 0:
+            self.failures -= 1
+            raise RuntimeError("数据库写入失败：disk I/O error")
+        return await self._store.create_ready_chunk(group_id, size)
+
+    async def complete_chunk(self, chunk_id: int, vector: list[float]) -> None:
+        await self._store.complete_chunk(chunk_id, vector)
 
 
 async def record_many(writer: MemoryWriter, group_id: int, count: int, *, start: int = 0) -> None:
@@ -326,15 +383,6 @@ class TestRecord:
 
         assert embedding.calls == []
 
-    async def test_full_queue_keeps_message_and_warns(self, harness, caplog):
-        writer = harness.writer(queue_size=1)
-
-        with caplog.at_level(logging.WARNING):
-            await record_many(writer, 100, 2)
-
-        assert "记忆队列已满" in caplog.text
-        assert len(await harness.store.recent_messages(100, 10)) == 2
-
 
 class TestRetry:
     async def test_transient_failure_retries_with_backoff_then_ready(self, harness):
@@ -433,6 +481,41 @@ class TestRecovery:
         assert count_rows(harness.path, 100)["memory_vectors"] == 1
         assert count_rows(harness.path, 200)["memory_vectors"] == 1
 
+    async def test_restart_chunks_raw_unchunked_messages_once(self, harness_factory):
+        first = await harness_factory()
+        for index in range(10):
+            await first.store.add_message(make_message(100, f"消息{index}", index=index))
+        await first.aclose()
+
+        second = await harness_factory()
+        working = FakeEmbedding()
+        writer = second.writer(working)
+        writer.start()
+        await asyncio.wait_for(writer.flush(), 1.0)
+
+        assert len(working.calls) == 1
+        assert count_rows(second.path, 100) == {
+            "messages": 10,
+            "chunks": 1,
+            "memory_vectors": 1,
+        }
+        assert await second.store.pending_chunks() == []
+        assert await second.store.pending_groups(10) == []
+        await second.aclose()
+
+        third = await harness_factory()
+        again = FakeEmbedding()
+        restarted = third.writer(again)
+        restarted.start()
+        await asyncio.wait_for(restarted.flush(), 1.0)
+
+        assert again.calls == []
+        assert count_rows(third.path, 100) == {
+            "messages": 10,
+            "chunks": 1,
+            "memory_vectors": 1,
+        }
+
     async def test_startup_recovery_failure_is_logged(self, harness, caplog):
         writer = MemoryWriter(harness.config, BrokenPendingStore(), FakeEmbedding())
         writer.start()
@@ -442,6 +525,82 @@ class TestRecovery:
 
         assert "待处理" in caplog.text
         assert "disk I/O error" in caplog.text
+
+    async def test_chunking_error_keeps_messages_for_retry(self, harness, caplog):
+        flaky = FlakyStore(harness.store, failures=99)
+        embedding = FakeEmbedding()
+        writer = MemoryWriter(harness.config, flaky, embedding)
+        writer.start()
+
+        with caplog.at_level(logging.ERROR):
+            await record_many(writer, 100, 10)
+            await asyncio.wait_for(writer.flush(), 1.0)
+
+        assert flaky.chunk_attempts >= 1
+        assert "分块失败" in caplog.text
+        assert count_rows(harness.path, 100) == {
+            "messages": 10,
+            "chunks": 0,
+            "memory_vectors": 0,
+        }
+
+        flaky.failures = 0
+        await asyncio.wait_for(writer.close(), 1.0)
+        writer.start()
+        await asyncio.wait_for(writer.flush(), 1.0)
+
+        assert len(embedding.calls) == 1
+        assert count_rows(harness.path, 100) == {
+            "messages": 10,
+            "chunks": 1,
+            "memory_vectors": 1,
+        }
+
+
+class TestLostWakes:
+    async def test_queue_full_wake_is_recovered_after_restart(self, harness_factory, caplog):
+        first = await harness_factory()
+        embedding = FakeEmbedding()
+        embedding.gate = asyncio.Event()
+        writer = first.writer(embedding, queue_size=1)
+        writer.start()
+        await record_many(writer, 100, 10)
+        await asyncio.wait_for(embedding.entered.wait(), 1.0)
+
+        with caplog.at_level(logging.WARNING):
+            await record_many(writer, 200, 10)
+            await record_many(writer, 300, 10)
+
+        assert "记忆队列已满" in caplog.text
+
+        embedding.gate.set()
+        await asyncio.wait_for(writer.flush(), 1.0)
+
+        assert count_rows(first.path, 100)["memory_vectors"] == 1
+        stranded = [
+            group_id
+            for group_id in (200, 300)
+            if count_rows(first.path, group_id)["memory_vectors"] == 0
+        ]
+        assert stranded, "队列容量为 1 时至少应有一个群的唤醒被丢弃"
+        assert set(await first.store.pending_groups(10)) == set(stranded)
+        await first.aclose()
+
+        second = await harness_factory()
+        working = FakeEmbedding()
+        restarted = second.writer(working)
+        restarted.start()
+        await asyncio.wait_for(restarted.flush(), 1.0)
+
+        for group_id in (100, 200, 300):
+            assert count_rows(second.path, group_id) == {
+                "messages": 10,
+                "chunks": 1,
+                "memory_vectors": 1,
+            }
+        assert len(working.calls) == len(stranded)
+        assert await second.store.pending_chunks() == []
+        assert await second.store.pending_groups(10) == []
 
 
 class TestClearGroup:
@@ -485,6 +644,156 @@ class TestClearGroup:
             "chunks": 0,
             "memory_vectors": 0,
         }
+
+
+class TestSupervision:
+    async def test_unexpected_worker_exit_is_supervised(self, harness, caplog):
+        embedding = FatalEmbedding()
+        writer = harness.writer(embedding)
+        writer.start()
+
+        with caplog.at_level(logging.ERROR):
+            await record_many(writer, 100, 10)
+            await wait_until(lambda: not writer.running)
+
+            assert "意外退出" in caplog.text
+            assert "模拟致命错误" in caplog.text
+
+            await asyncio.wait_for(writer.flush(timeout=1.0), 1.0)
+            await asyncio.wait_for(writer.close(), 1.0)
+
+            await writer.record(make_message(100, "消息10", index=10))
+
+        assert embedding.calls == 1
+        assert writer._queue.empty()
+        assert len(await harness.store.recent_messages(100, 20)) == 11
+
+        restarted = harness.writer(FakeEmbedding())
+        restarted.start()
+        await asyncio.wait_for(restarted.flush(), 1.0)
+
+        assert count_rows(harness.path, 100) == {
+            "messages": 11,
+            "chunks": 1,
+            "memory_vectors": 1,
+        }
+
+    async def test_cancelled_worker_is_supervised(self, harness, caplog):
+        embedding = FakeEmbedding()
+        embedding.gate = asyncio.Event()
+        writer = harness.writer(embedding)
+        writer.start()
+        await record_many(writer, 100, 10)
+        await asyncio.wait_for(embedding.entered.wait(), 1.0)
+
+        task = writer._task
+        assert task is not None
+        with caplog.at_level(logging.WARNING):
+            task.cancel()
+            await wait_until(lambda: not writer.running)
+            assert "意外取消" in caplog.text
+
+        await asyncio.wait_for(writer.flush(timeout=1.0), 1.0)
+        await asyncio.wait_for(writer.close(), 1.0)
+
+    async def test_close_suppresses_worker_cancellation(self, harness):
+        embedding = FakeEmbedding()
+        embedding.gate = asyncio.Event()
+        writer = harness.writer(embedding)
+        writer.start()
+        await record_many(writer, 100, 10)
+        await asyncio.wait_for(embedding.entered.wait(), 1.0)
+
+        worker_task = writer._task
+        assert worker_task is not None
+        close_task = asyncio.create_task(writer.close())
+        await asyncio.sleep(0)
+        worker_task.cancel()
+
+        await asyncio.wait_for(close_task, 1.0)
+
+    async def test_close_propagates_caller_cancellation(self, harness):
+        embedding = FakeEmbedding()
+        embedding.gate = asyncio.Event()
+        writer = harness.writer(embedding)
+        writer.start()
+        await record_many(writer, 100, 10)
+        await asyncio.wait_for(embedding.entered.wait(), 1.0)
+
+        close_task = asyncio.create_task(writer.close())
+        await asyncio.sleep(0)
+        close_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+
+        embedding.gate.set()
+        await asyncio.wait_for(writer.close(), 1.0)
+        (chunk,) = await harness.store.search(100, VECTOR, 5)
+        assert chunk.status is ChunkStatus.READY
+
+
+class TestFlushTimeout:
+    async def test_flush_timeout_raises_without_breaking_close(self, harness):
+        embedding = FakeEmbedding()
+        embedding.gate = asyncio.Event()
+        writer = harness.writer(embedding)
+        writer.start()
+        await record_many(writer, 100, 10)
+        await asyncio.wait_for(embedding.entered.wait(), 1.0)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await writer.flush(timeout=0.1)
+
+        embedding.gate.set()
+        await asyncio.wait_for(writer.flush(timeout=1.0), 1.0)
+        (chunk,) = await harness.store.search(100, VECTOR, 5)
+        assert chunk.status is ChunkStatus.READY
+        await asyncio.wait_for(writer.close(), 1.0)
+
+    async def test_flush_timeout_bounds_startup_recovery(self, harness):
+        for index in range(10):
+            await harness.store.add_message(make_message(100, f"消息{index}", index=index))
+        pending = await harness.store.create_ready_chunk(100, 10)
+        assert pending is not None
+        embedding = FakeEmbedding()
+        embedding.gate = asyncio.Event()
+        writer = harness.writer(embedding)
+        writer.start()
+        await asyncio.wait_for(embedding.entered.wait(), 1.0)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await writer.flush(timeout=0.1)
+
+        embedding.gate.set()
+        await asyncio.wait_for(writer.flush(timeout=1.0), 1.0)
+        assert await harness.store.pending_chunks() == []
+
+    async def test_concurrent_flushes_wait_for_the_same_work(self, harness):
+        embedding = FakeEmbedding()
+        embedding.gate = asyncio.Event()
+        writer = harness.writer(embedding)
+        writer.start()
+        await record_many(writer, 100, 10)
+        await asyncio.wait_for(embedding.entered.wait(), 1.0)
+
+        first = asyncio.create_task(writer.flush())
+        second = asyncio.create_task(writer.flush(timeout=1.0))
+        for task in (first, second):
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(task), 0.1)
+
+        embedding.gate.set()
+        await asyncio.wait_for(asyncio.gather(first, second), 1.0)
+        (chunk,) = await harness.store.search(100, VECTOR, 5)
+        assert chunk.status is ChunkStatus.READY
+
+    async def test_flush_returns_without_live_worker(self, harness):
+        writer = harness.writer()
+        writer.start()
+        await asyncio.wait_for(writer.close(), 1.0)
+
+        assert writer.running is False
+        await asyncio.wait_for(writer.flush(timeout=0.5), 0.5)
 
 
 class TestLifecycle:
@@ -568,3 +877,4 @@ class TestLifecycle:
 
         assert len(await harness.store.recent_messages(100, 10)) == 1
         assert embedding.calls == []
+        assert writer._queue.empty()

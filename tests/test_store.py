@@ -378,6 +378,73 @@ class TestChunks:
             await store.create_ready_chunk(100, 0)
 
 
+class TestPendingGroups:
+    async def test_lists_groups_with_enough_unchunked_messages(self, store):
+        for index in range(2):
+            await store.add_message(make_message(100, f"a{index}", index=index))
+        await store.add_message(make_message(200, "b0", index=0))
+        await store.add_message(make_message(300, "c0", index=0))
+
+        assert await store.pending_groups(2) == [100]
+        assert await store.pending_groups(1) == [100, 200, 300]
+
+    async def test_excludes_groups_whose_messages_are_chunked(self, store):
+        await seed_chunk(store, 100, ["m0", "m1"], [1.0, 0.0, 0.0, 0.0])
+
+        assert await store.pending_groups(1) == []
+
+    async def test_counts_only_unchunked_messages(self, store):
+        for index in range(5):
+            await store.add_message(make_message(100, f"m{index}", index=index))
+        await store.create_ready_chunk(100, 2)
+
+        assert await store.pending_groups(3) == [100]
+        assert await store.pending_groups(4) == []
+
+    async def test_counts_every_residual_chunk(self, store):
+        for index in range(20):
+            await store.add_message(make_message(100, f"m{index}", index=index))
+        await store.create_ready_chunk(100, 10)
+
+        assert await store.pending_groups(10) == [100]
+        assert await store.pending_groups(11) == []
+
+    async def test_orders_groups_by_id(self, store):
+        for group_id in (300, 100, 200):
+            for index in range(2):
+                await store.add_message(make_message(group_id, f"m{index}", index=index))
+
+        assert await store.pending_groups(2) == [100, 200, 300]
+
+    async def test_ignores_cleared_groups(self, store):
+        for index in range(2):
+            await store.add_message(make_message(100, f"m{index}", index=index))
+        await store.clear_group(100)
+
+        assert await store.pending_groups(1) == []
+
+    async def test_survives_restart(self, tmp_path):
+        config = make_config(tmp_path)
+        first = await open_store(config)
+        try:
+            for index in range(2):
+                await first.add_message(make_message(100, f"m{index}", index=index))
+        finally:
+            await first.close()
+
+        second = await open_store(config)
+        try:
+            assert await second.pending_groups(2) == [100]
+        finally:
+            await second.close()
+
+    async def test_rejects_non_positive_size(self, store):
+        with pytest.raises(ValueError):
+            await store.pending_groups(0)
+        with pytest.raises(ValueError):
+            await store.pending_groups(-1)
+
+
 class TestSearch:
     async def test_returns_nearest_chunks_in_distance_order(self, store):
         farthest = await seed_chunk(store, 100, ["m0", "m1"], [0.0, 1.0, 0.0, 0.0], start=0)
