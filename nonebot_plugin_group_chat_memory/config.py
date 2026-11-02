@@ -12,6 +12,13 @@ DEFAULT_SYSTEM_PROMPT = (
     "只使用提供的聊天记录和长期记忆，不要假装记得没有出现过的内容。"
 )
 
+RUNTIME_CONFIG_DEFAULTS = {
+    "chat_base_url": "",
+    "chat_api_key": "",
+    "chat_model": "deepseek-v4.1-flash",
+    "embedding_api_key": "",
+}
+
 
 class ConfigError(RuntimeError):
     """功能所需的配置缺失时抛出。"""
@@ -24,7 +31,7 @@ def _localstore_data_dir() -> Path:
 
 
 class Config(BaseModel):
-    """群聊记忆插件配置，所有字段均可通过环境变量或 NoneBot 配置提供。"""
+    """群聊记忆插件配置；四个模型运行时字段由私聊命令和数据库覆盖。"""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -57,6 +64,19 @@ class Config(BaseModel):
         if configured:
             return Path(configured).expanduser()
         return _localstore_data_dir() / DEFAULT_DB_FILENAME
+
+    def apply_runtime_config(self, values: dict[str, str]) -> None:
+        """应用数据库中的四项全局配置，未保存的字段恢复内置默认值。"""
+        for key, default in RUNTIME_CONFIG_DEFAULTS.items():
+            value = values.get(key, default)
+            if key == "chat_base_url":
+                self.group_chat_memory_chat_base_url = value
+            elif key == "chat_api_key":
+                self.group_chat_memory_chat_api_key = SecretStr(value)
+            elif key == "chat_model":
+                self.group_chat_memory_chat_model = value
+            elif key == "embedding_api_key":
+                self.group_chat_memory_embedding_api_key = SecretStr(value)
 
     def require_chat_config(self) -> None:
         """检查聊天模型配置，仅在真正调用聊天功能时使用。"""

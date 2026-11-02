@@ -69,11 +69,8 @@ def embedding_payload(vectors: list[list[float]]) -> dict[str, object]:
 @pytest_asyncio.fixture(loop_scope="function")
 async def integrated_runtime(monkeypatch, tmp_path):
     config = Config(
-        group_chat_memory_chat_base_url="https://chat.example/v1",
-        group_chat_memory_chat_api_key="sk-chat",
         group_chat_memory_chat_timeout=1,
         group_chat_memory_embedding_base_url="https://embedding.example/v1",
-        group_chat_memory_embedding_api_key="sk-embedding",
         group_chat_memory_embedding_dimensions=2,
         group_chat_memory_embedding_timeout=1,
         group_chat_memory_query_timeout=0.2,
@@ -91,6 +88,14 @@ async def integrated_runtime(monkeypatch, tmp_path):
     monkeypatch.setattr(handlers, "chat_client", ChatClient(config, retry_delays=()))
     monkeypatch.setattr(handlers, "coordinator", coordinator)
     handlers._bots.clear()
+    await store.open()
+    for key, value in {
+        "chat_base_url": "https://chat.example/v1",
+        "chat_api_key": "sk-chat",
+        "chat_model": "deepseek-v4.1-flash",
+        "embedding_api_key": "sk-embedding",
+    }.items():
+        await store.set_runtime_config(key, value)
     await handlers.startup()
     try:
         yield SimpleNamespace(config=config, store=store, writer=writer)

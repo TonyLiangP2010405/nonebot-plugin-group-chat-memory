@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 import aiosqlite
 import sqlite_vec
 
-from .config import Config
+from .config import RUNTIME_CONFIG_DEFAULTS, Config
 from .models import Chunk, ChunkStatus, Message
 
 DIMENSIONS_META_KEY = "embedding_dimensions"
@@ -17,6 +17,12 @@ DIMENSIONS_META_KEY = "embedding_dimensions"
 _SCHEMA_STATEMENTS = (
     """
     CREATE TABLE IF NOT EXISTS meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS runtime_config (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
     )
@@ -180,6 +186,26 @@ class MemoryStore:
                 "ON CONFLICT(group_id) DO UPDATE SET "
                 "probability = excluded.probability, updated_at = excluded.updated_at",
                 (group_id, probability, _format_timestamp(_utc_now())),
+            )
+
+    async def get_runtime_config(self) -> dict[str, str]:
+        """读取全 Bot 共用的模型运行时配置。"""
+        async with self._lock:
+            db = self._require_db()
+            cursor = await db.execute("SELECT key, value FROM runtime_config")
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return {row["key"]: row["value"] for row in rows}
+
+    async def set_runtime_config(self, key: str, value: str) -> None:
+        """持久化一项白名单内的全局模型配置。"""
+        if key not in RUNTIME_CONFIG_DEFAULTS:
+            raise ValueError(f"不支持的运行时配置项：{key}")
+        async with self._transaction() as db:
+            await db.execute(
+                "INSERT INTO runtime_config(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
             )
 
     async def create_ready_chunk(self, group_id: int, size: int) -> Chunk | None:

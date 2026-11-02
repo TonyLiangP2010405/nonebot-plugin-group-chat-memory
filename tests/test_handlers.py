@@ -484,6 +484,11 @@ async def test_lifecycle_startup_and_shutdown_order(runtime, monkeypatch):
         handlers.store, "open", AsyncMock(side_effect=lambda: calls.append("open"))
     )
     monkeypatch.setattr(
+        handlers.store,
+        "get_runtime_config",
+        AsyncMock(side_effect=lambda: calls.append("load") or {}),
+    )
+    monkeypatch.setattr(
         handlers.writer, "start", MagicMock(side_effect=lambda: calls.append("start"))
     )
     monkeypatch.setattr(
@@ -506,6 +511,7 @@ async def test_lifecycle_startup_and_shutdown_order(runtime, monkeypatch):
 
     assert calls == [
         "open",
+        "load",
         "start",
         "flush:5",
         "writer close",

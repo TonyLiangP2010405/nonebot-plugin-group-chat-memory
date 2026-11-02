@@ -37,6 +37,7 @@ _bots: dict[int, Bot] = {}
 
 async def startup() -> None:
     await store.open()
+    config.apply_runtime_config(await store.get_runtime_config())
     writer.start()
 
 
