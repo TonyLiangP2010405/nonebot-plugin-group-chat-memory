@@ -29,7 +29,7 @@ class TestConfigDefaults:
         assert config.group_chat_memory_long_term_memories == 5
         assert config.group_chat_memory_default_probability == 0.0
         assert config.group_chat_memory_ignored_qq == set()
-        assert config.group_chat_memory_db_path == ""
+        assert config.group_chat_memory_db_path_override is None
 
     def test_ignores_unrelated_nonebot_fields(self):
         config = Config(superusers={"10001"}, driver="~fastapi")
@@ -38,26 +38,35 @@ class TestConfigDefaults:
 
 
 class TestDatabasePath:
-    def test_uses_localstore_plugin_data_dir_by_default(self, monkeypatch, tmp_path):
+    def test_default_database_path_is_non_empty_and_raw_field_is_not_usable(
+        self, monkeypatch, tmp_path
+    ):
         monkeypatch.setattr(config_module, "_localstore_data_dir", lambda: tmp_path)
 
-        assert Config().database_path == tmp_path / "group_chat_memory.db"
+        config = Config()
 
-    def test_blank_path_falls_back_to_localstore(self, monkeypatch, tmp_path):
+        assert config.database_path == tmp_path / "group_chat_memory.db"
+        assert str(config.database_path) != ""
+        assert config.group_chat_memory_db_path_override is None
+        assert not hasattr(config, "group_chat_memory_db_path")
+        with pytest.raises(AttributeError):
+            _ = config.group_chat_memory_db_path
+
+    def test_blank_override_falls_back_to_localstore(self, monkeypatch, tmp_path):
         monkeypatch.setattr(config_module, "_localstore_data_dir", lambda: tmp_path)
 
-        assert Config(group_chat_memory_db_path="   ").database_path == (
+        assert Config(group_chat_memory_db_path_override="   ").database_path == (
             tmp_path / "group_chat_memory.db"
         )
 
-    def test_configured_path_takes_precedence(self, monkeypatch, tmp_path):
+    def test_configured_override_takes_precedence(self, monkeypatch, tmp_path):
         def unexpected_call():
             raise AssertionError("localstore should not be consulted for a configured path")
 
         monkeypatch.setattr(config_module, "_localstore_data_dir", unexpected_call)
         path = tmp_path / "custom" / "memory.db"
 
-        assert Config(group_chat_memory_db_path=str(path)).database_path == path
+        assert Config(group_chat_memory_db_path_override=str(path)).database_path == path
 
 
 class TestProbability:

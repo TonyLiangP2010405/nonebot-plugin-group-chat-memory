@@ -31,7 +31,7 @@ respx = ">=0.21"
 ruff = ">=0.6"
 
 [build-system]
-requires = ["poetry-core>=1.8.0"]
+requires = ["poetry-core>=2.0.0"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.nonebot]

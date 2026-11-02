@@ -39,7 +39,7 @@ class Config(BaseModel):
     group_chat_memory_embedding_dimensions: int = Field(default=1024, gt=0)
     group_chat_memory_embedding_timeout: float = Field(default=10.0, gt=0)
 
-    group_chat_memory_db_path: str = ""
+    group_chat_memory_db_path_override: str | None = None
 
     group_chat_memory_recent_messages: int = Field(default=20, ge=1)
     group_chat_memory_chunk_size: int = Field(default=10, ge=1)
@@ -52,7 +52,7 @@ class Config(BaseModel):
     @property
     def database_path(self) -> Path:
         """数据库文件路径；未配置时使用 localstore 的插件数据目录。"""
-        configured = self.group_chat_memory_db_path.strip()
+        configured = (self.group_chat_memory_db_path_override or "").strip()
         if configured:
             return Path(configured).expanduser()
         return _localstore_data_dir() / DEFAULT_DB_FILENAME
