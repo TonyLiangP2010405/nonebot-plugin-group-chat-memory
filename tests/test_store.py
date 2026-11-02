@@ -71,6 +71,23 @@ async def seed_chunk(
     return chunk
 
 
+def table_counts(path, group_id: int) -> dict[str, int]:
+    """通过独立连接直接统计各表的行数，避免经过会过滤孤儿行的 JOIN 查询。"""
+    connection = sqlite3.connect(path)
+    connection.enable_load_extension(True)
+    sqlite_vec.load(connection)
+    connection.enable_load_extension(False)
+    try:
+        return {
+            table: connection.execute(
+                f"SELECT count(*) FROM {table} WHERE group_id = ?", (group_id,)
+            ).fetchone()[0]
+            for table in ("messages", "chunks", "memory_vectors")
+        }
+    finally:
+        connection.close()
+
+
 @pytest.fixture
 async def store(tmp_path):
     store = await open_store(make_config(tmp_path))
@@ -464,7 +481,26 @@ class TestClearGroup:
         assert "m0" not in chunk.text
         assert "fresh-0" in chunk.text
 
-    async def test_clear_only_affects_target_group(self, store):
+    async def test_clear_deletes_vector_and_chunk_rows_from_database(self, store, tmp_path):
+        await seed_chunk(store, 100, ["m0", "m1"], [1.0, 0.0, 0.0, 0.0])
+        await store.add_message(make_message(100, "m2", index=2))
+        path = tmp_path / "memory.db"
+
+        assert table_counts(path, 100) == {
+            "messages": 3,
+            "chunks": 1,
+            "memory_vectors": 1,
+        }
+
+        await store.clear_group(100)
+
+        assert table_counts(path, 100) == {
+            "messages": 0,
+            "chunks": 0,
+            "memory_vectors": 0,
+        }
+
+    async def test_clear_only_affects_target_group(self, store, tmp_path):
         await store.set_probability(100, 10.0)
         await store.set_probability(200, 20.0)
         chunk_a = await seed_chunk(store, 100, ["a0", "a1"], [1.0, 0.0, 0.0, 0.0])
@@ -475,6 +511,17 @@ class TestClearGroup:
 
         await store.clear_group(100)
 
+        path = tmp_path / "memory.db"
+        assert table_counts(path, 100) == {
+            "messages": 0,
+            "chunks": 0,
+            "memory_vectors": 0,
+        }
+        assert table_counts(path, 200) == {
+            "messages": 4,
+            "chunks": 2,
+            "memory_vectors": 1,
+        }
         assert await store.recent_messages(100, 10) == []
         assert await store.search(100, [1.0, 0.0, 0.0, 0.0], 5) == []
         assert [message.text for message in await store.recent_messages(200, 10)] == [
