@@ -23,3 +23,4 @@ except ValueError:
     pass  # 允许在 NoneBot 初始化前单独导入模块
 else:
     require("nonebot_plugin_localstore")
+    from . import handlers as handlers
