@@ -48,7 +48,7 @@
   Run: `poetry run pytest tests/test_config.py -v`
   Expected: FAIL，模块尚不存在。
 - [ ] **Step 3: 创建 Poetry 包和配置模型**
-  声明上述运行时与开发依赖；`Config` 要求聊天 `base_url/api_key`，Embedding 默认硅基流动地址但密钥必填。`Message` 包含群、用户、显示名、正文、时间和 `is_bot`；`Chunk` 包含 ID、群、正文和状态；`ChatContext` 包含最近消息与长期片段。注册插件元数据和 OneBot v11 支持。
+  声明上述运行时与开发依赖，并加入 `nonebot-plugin-localstore`；默认数据库路径由 localstore 的插件数据目录提供。聊天 `base_url/api_key` 与 Embedding 密钥允许为空以保证零配置导入，运行所需功能时检查并给出简短配置提示。`Message` 包含群、用户、显示名、正文、时间和 `is_bot`；`Chunk` 包含 ID、群、正文和状态；`ChatContext` 包含最近消息与长期片段。注册插件元数据和 OneBot v11 支持。
 - [ ] **Step 4: 验证骨架**
   Run: `poetry run pytest tests/test_config.py -v && poetry run ruff check .`
   Expected: PASS。
