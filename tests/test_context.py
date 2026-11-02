@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -194,6 +195,76 @@ class TestContextBuilder:
 
         assert embedding.calls == []
         assert context.long_term_chunks == []
+
+    async def test_fast_lookup_within_query_timeout_returns_chunks(self, store, tmp_path):
+        chunk = await seed_chunk(store, 100, ["旧记忆", "继续"], QUERY_VECTOR)
+        config = make_config(tmp_path, group_chat_memory_query_timeout=0.5)
+
+        context = await asyncio.wait_for(
+            ContextBuilder(config, store, FakeEmbedding()).build(100, "查询"), timeout=2.0
+        )
+
+        assert [item.id for item in context.long_term_chunks] == [chunk.id]
+
+    async def test_hanging_embedding_degrades_to_recent_messages_within_deadline(
+        self, store, tmp_path
+    ):
+        await store.add_message(make_message("最近消息"))
+
+        class BlockedEmbedding:
+            def __init__(self) -> None:
+                self.calls: list[list[str]] = []
+
+            async def embed(self, texts: list[str]) -> list[list[float]]:
+                self.calls.append(list(texts))
+                await asyncio.Event().wait()
+                return []
+
+        embedding = BlockedEmbedding()
+        config = make_config(tmp_path, group_chat_memory_query_timeout=0.05)
+        started = time.monotonic()
+
+        context = await asyncio.wait_for(
+            ContextBuilder(config, store, embedding).build(100, "查询"), timeout=2.0
+        )
+        elapsed = time.monotonic() - started
+
+        assert embedding.calls == [["查询"]]
+        assert [message.text for message in context.recent_messages] == ["最近消息"]
+        assert context.long_term_chunks == []
+        assert elapsed < 1.0
+
+    async def test_hanging_search_degrades_to_recent_messages_within_deadline(
+        self, store, tmp_path
+    ):
+        await store.add_message(make_message("最近消息"))
+        search_calls: list[list[float]] = []
+
+        class BlockedSearchStore:
+            def __init__(self, inner: MemoryStore) -> None:
+                self._inner = inner
+
+            async def recent_messages(self, group_id: int, limit: int):
+                return await self._inner.recent_messages(group_id, limit)
+
+            async def search(self, group_id: int, vector: list[float], limit: int):
+                search_calls.append(list(vector))
+                await asyncio.Event().wait()
+                return []
+
+        config = make_config(tmp_path, group_chat_memory_query_timeout=0.05)
+        started = time.monotonic()
+
+        context = await asyncio.wait_for(
+            ContextBuilder(config, BlockedSearchStore(store), FakeEmbedding()).build(100, "查询"),
+            timeout=2.0,
+        )
+        elapsed = time.monotonic() - started
+
+        assert search_calls == [QUERY_VECTOR]
+        assert [message.text for message in context.recent_messages] == ["最近消息"]
+        assert context.long_term_chunks == []
+        assert elapsed < 1.0
 
     async def test_reads_recent_messages_and_embeds_concurrently(self, tmp_path):
         recent_started = asyncio.Event()

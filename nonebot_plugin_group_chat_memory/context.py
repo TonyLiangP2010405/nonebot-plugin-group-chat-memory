@@ -43,17 +43,24 @@ class ContextBuilder:
         return ChatContext(recent_messages=recent, long_term_chunks=chunks)
 
     async def _long_term_chunks(self, group_id: int, query: str) -> list[Chunk]:
+        """在独立短超时内完成查询向量与检索，超时或失败都降级为空列表。"""
         limit = self._config.group_chat_memory_long_term_memories
         if limit < 1 or not query.strip():
             return []
         try:
-            vectors = await self._embedding.embed([query])
-            if not vectors:
-                return []
-            return await self._store.search(group_id, vectors[0], limit)
+            return await asyncio.wait_for(
+                self._lookup_long_term(group_id, query, limit),
+                timeout=self._config.group_chat_memory_query_timeout,
+            )
         except Exception as exc:
             logger.warning("长期记忆检索失败，仅使用最近消息：%s: %s", type(exc).__name__, exc)
             return []
+
+    async def _lookup_long_term(self, group_id: int, query: str, limit: int) -> list[Chunk]:
+        vectors = await self._embedding.embed([query])
+        if not vectors:
+            return []
+        return await self._store.search(group_id, vectors[0], limit)
 
 
 def build_chat_messages(

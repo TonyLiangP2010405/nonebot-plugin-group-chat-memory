@@ -138,6 +138,23 @@ class TestEmbeddingClient:
 
         assert timeouts == [3.5]
 
+    async def test_embedding_timeout_is_independent_of_query_timeout(self, monkeypatch):
+        config = make_config(group_chat_memory_query_timeout=0.25)
+        timeouts: list[float] = []
+        real_make_client = api._make_client
+
+        def spy(timeout):
+            timeouts.append(timeout)
+            return real_make_client(timeout)
+
+        monkeypatch.setattr(api, "_make_client", spy)
+        with respx.mock(assert_all_called=False) as mock:
+            mock.post(EMBEDDINGS_URL).mock(return_value=embedding_response([[0.1, 0.2, 0.3, 0.4]]))
+
+            await EmbeddingClient(config).embed(["x"])
+
+        assert timeouts == [3.5]
+
     @pytest.mark.parametrize("status", [400, 401, 500, 503])
     async def test_non_2xx_raises_sanitized_error(self, config, status):
         with respx.mock(assert_all_called=False) as mock:

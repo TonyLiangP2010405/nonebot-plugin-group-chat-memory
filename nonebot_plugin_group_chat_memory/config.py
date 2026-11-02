@@ -38,6 +38,7 @@ class Config(BaseModel):
     group_chat_memory_embedding_model: str = "BAAI/bge-m3"
     group_chat_memory_embedding_dimensions: int = Field(default=1024, gt=0)
     group_chat_memory_embedding_timeout: float = Field(default=10.0, gt=0)
+    group_chat_memory_query_timeout: float = Field(default=3.0, gt=0)
 
     group_chat_memory_db_path_override: str | None = None
 

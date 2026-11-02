@@ -24,6 +24,7 @@ class TestConfigDefaults:
         assert config.group_chat_memory_embedding_api_key.get_secret_value() == ""
         assert config.group_chat_memory_embedding_model == "BAAI/bge-m3"
         assert config.group_chat_memory_embedding_dimensions == 1024
+        assert config.group_chat_memory_query_timeout == 3.0
         assert config.group_chat_memory_recent_messages == 20
         assert config.group_chat_memory_chunk_size == 10
         assert config.group_chat_memory_long_term_memories == 5
@@ -35,6 +36,24 @@ class TestConfigDefaults:
         config = Config(superusers={"10001"}, driver="~fastapi")
 
         assert config.group_chat_memory_recent_messages == 20
+
+
+class TestQueryTimeout:
+    def test_default_is_short_and_independent_of_embedding_timeout(self):
+        config = Config()
+
+        assert config.group_chat_memory_query_timeout == 3.0
+        assert config.group_chat_memory_query_timeout < config.group_chat_memory_embedding_timeout
+
+    def test_accepts_positive_timeout(self):
+        config = Config(group_chat_memory_query_timeout=0.25)
+
+        assert config.group_chat_memory_query_timeout == 0.25
+
+    @pytest.mark.parametrize("value", [0, -0.5, -3])
+    def test_rejects_non_positive_timeout(self, value):
+        with pytest.raises(ValidationError):
+            Config(group_chat_memory_query_timeout=value)
 
 
 class TestDatabasePath:
