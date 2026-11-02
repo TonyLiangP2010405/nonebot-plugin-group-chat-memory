@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Annotated
 
 from nonebot import get_driver, on_command, on_message
-from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message
+from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, MessageSegment
 from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
 
@@ -66,7 +66,7 @@ async def reply(group_id: int, message: MemoryMessage) -> None:
         await bot.send_group_msg(group_id=group_id, message=GENERIC_REPLY_ERROR)
         return
 
-    await bot.send_group_msg(group_id=group_id, message=response)
+    await bot.send_group_msg(group_id=group_id, message=MessageSegment.text(response))
     await writer.record(
         MemoryMessage(
             group_id=group_id,
@@ -129,10 +129,14 @@ async def handle_clear(bot: Bot, event: GroupMessageEvent) -> None:
 
 @group_message_matcher.handle()
 async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
-    directed = event.to_me or (
+    explicit_at = any(
+        segment.type == "at" and segment.data.get("qq") == str(bot.self_id)
+        for segment in event.message
+    )
+    directed = explicit_at or (
         event.reply is not None and event.reply.sender.user_id == int(bot.self_id)
     )
-    allowed_types = {"text", "at", "reply"} if directed else {"text"}
+    allowed_types = {"text", "at", "reply"}
     if any(segment.type not in allowed_types for segment in event.message):
         return
 
@@ -151,7 +155,11 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     await writer.record(memory_message)
     if directed:
         coordinator.submit(event.group_id, memory_message, explicit=True)
-    elif event.reply is None and await coordinator.should_random_reply(event.group_id):
+    elif (
+        event.reply is None
+        and all(segment.type == "text" for segment in event.message)
+        and await coordinator.should_random_reply(event.group_id)
+    ):
         coordinator.submit(event.group_id, memory_message, explicit=False)
 
 

@@ -127,7 +127,9 @@ async def receive(
         if runtime is not None and stored_count is not None:
             await wait_for_message_count(runtime.store, event.group_id, stored_count)
         if reply is not None and runtime is not None:
-            send_group_msg.assert_awaited_once_with(group_id=event.group_id, message=reply)
+            send_group_msg.assert_awaited_once_with(
+                group_id=event.group_id, message=MessageSegment.text(reply)
+            )
 
 
 @respx.mock

@@ -135,7 +135,7 @@ async def runtime(monkeypatch):
 async def test_directed_message_always_replies_and_records_bot(app: App, runtime, kind):
     if kind == "at":
         message = Message([MessageSegment.at(BOT_ID), MessageSegment.text(" 你好 ")])
-        event = make_group_event(message, to_me=True)
+        event = make_group_event(message)
     else:
         message = Message([MessageSegment.reply(99), MessageSegment.text(" 你好 ")])
         event = make_group_event(message, reply=bot_reply())
@@ -144,7 +144,7 @@ async def test_directed_message_always_replies_and_records_bot(app: App, runtime
         bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
         ctx.should_call_api(
             "send_group_msg",
-            {"group_id": GROUP_ID, "message": "模型回复"},
+            {"group_id": GROUP_ID, "message": MessageSegment.text("模型回复")},
             {"message_id": 123},
         )
         ctx.receive_event(bot, event)
@@ -166,6 +166,29 @@ async def test_directed_message_always_replies_and_records_bot(app: App, runtime
     assert outgoing.is_bot is True
 
 
+async def test_model_output_is_sent_and_stored_as_literal_plain_text(app: App, runtime):
+    response = "字面量 [CQ:at,qq=all] 不应执行"
+    runtime.complete.return_value = response
+    event = make_group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text("你好")]), to_me=True
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        bot.send_group_msg = AsyncMock(return_value={"message_id": 123})
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_until(lambda: runtime.record.await_count == 2)
+
+    bot.send_group_msg.assert_awaited_once()
+    assert bot.send_group_msg.await_args.kwargs["group_id"] == GROUP_ID
+    outgoing = bot.send_group_msg.await_args.kwargs["message"]
+    assert isinstance(outgoing, MessageSegment)
+    assert outgoing.type == "text"
+    assert outgoing.data == {"text": response}
+    assert runtime.record.await_args_list[-1].args[0].text == response
+
+
 async def test_plain_message_only_records_at_default_probability(app: App, runtime):
     event = make_group_event("普通聊天")
 
@@ -173,11 +196,23 @@ async def test_plain_message_only_records_at_default_probability(app: App, runti
         bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
         ctx.receive_event(bot, event)
         await ctx.run()
-        await wait_until(lambda: runtime.record.await_count == 1)
 
     runtime.complete.assert_not_awaited()
     runtime.get_probability.assert_awaited_once_with(GROUP_ID)
     assert runtime.record.await_args.args[0].text == "普通聊天"
+
+
+async def test_nickname_only_to_me_does_not_force_reply(app: App, runtime):
+    event = make_group_event("昵称提到了机器人", to_me=True)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.receive_event(bot, event)
+        await ctx.run()
+
+    runtime.complete.assert_not_awaited()
+    runtime.get_probability.assert_awaited_once_with(GROUP_ID)
+    assert runtime.record.await_args.args[0].text == "昵称提到了机器人"
 
 
 async def test_plain_message_replies_at_100_percent(app: App, runtime):
@@ -188,7 +223,7 @@ async def test_plain_message_replies_at_100_percent(app: App, runtime):
         bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
         ctx.should_call_api(
             "send_group_msg",
-            {"group_id": GROUP_ID, "message": "模型回复"},
+            {"group_id": GROUP_ID, "message": MessageSegment.text("模型回复")},
             {"message_id": 123},
         )
         ctx.receive_event(bot, event)
@@ -243,7 +278,8 @@ async def test_reply_to_another_user_is_recorded_without_random_reply(app: App, 
     runtime.get_probability.return_value = 100.0
     reply = bot_reply()
     reply.sender.user_id = USER_ID
-    event = make_group_event("回复别人", reply=reply)
+    message = Message([MessageSegment.reply(99), MessageSegment.text("回复别人")])
+    event = make_group_event(message, reply=reply)
 
     async with app.test_matcher() as ctx:
         bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
@@ -252,6 +288,22 @@ async def test_reply_to_another_user_is_recorded_without_random_reply(app: App, 
 
     runtime.record.assert_awaited_once()
     assert runtime.record.await_args.args[0].text == "回复别人"
+    runtime.complete.assert_not_awaited()
+    runtime.get_probability.assert_not_awaited()
+
+
+async def test_at_another_user_is_recorded_without_random_reply(app: App, runtime):
+    runtime.get_probability.return_value = 100.0
+    message = Message([MessageSegment.at(USER_ID + 1), MessageSegment.text("提到别人")])
+    event = make_group_event(message)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.receive_event(bot, event)
+        await ctx.run()
+
+    runtime.record.assert_awaited_once()
+    assert runtime.record.await_args.args[0].text == "提到别人"
     runtime.complete.assert_not_awaited()
     runtime.get_probability.assert_not_awaited()
 
