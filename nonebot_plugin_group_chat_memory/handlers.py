@@ -350,18 +350,16 @@ async def handle_affection_switch(
     await affection_switch_matcher.finish(INVALID_AFFECTION_SWITCH)
 
 
-async def _should_random_reply(event: GroupMessageEvent) -> bool:
-    """随机触发判断：好感榜成员至少按当前群配置概率触发，其余按群概率。"""
-    minimum = 0.0
-    if await store.get_affection_enabled(event.group_id):
-        probability = await store.get_affection_probability(event.group_id)
-        if probability > 0 and await affection_leaderboard.is_member(
-            event.group_id, event.user_id
-        ):
-            minimum = probability
-    return await coordinator.should_random_reply(
-        event.group_id, minimum_probability=minimum
-    )
+async def _affection_probability(event: GroupMessageEvent) -> float:
+    """好感榜成员的最低触发概率；不适用时返回 0。"""
+    if not await store.get_affection_enabled(event.group_id):
+        return 0.0
+    probability = await store.get_affection_probability(event.group_id)
+    if probability <= 0:
+        return 0.0
+    if not await affection_leaderboard.is_member(event.group_id, event.user_id):
+        return 0.0
+    return probability
 
 
 @group_message_matcher.handle()
@@ -396,13 +394,21 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         else:
             await bot.send_group_msg(group_id=event.group_id, message=RATE_LIMIT_NOTICE)
         raise StopPropagation
-    elif (
-        event.reply is None
-        and all(segment.type == "text" for segment in event.message)
-        and await _should_random_reply(event)
-        and await store.consume_request_slot(event.group_id)
+    if event.reply is not None:
+        return
+    if any(segment.type != "text" for segment in event.message):
+        return
+
+    affection_probability = await _affection_probability(event)
+    if not await coordinator.should_random_reply(
+        event.group_id, minimum_probability=affection_probability
     ):
-        coordinator.submit(event.group_id, memory_message, explicit=False)
+        return
+    if affection_probability <= 0 and not await store.consume_request_slot(
+        event.group_id
+    ):
+        return
+    coordinator.submit(event.group_id, memory_message, explicit=False)
 
 
 driver = get_driver()

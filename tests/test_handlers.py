@@ -1276,3 +1276,70 @@ async def test_affection_command_changes_real_store_and_reply(app: App, monkeypa
         await coordinator.close()
         await store.close()
         handlers._bots.clear()
+
+
+async def test_affection_trigger_bypasses_hourly_limit(app: App, runtime, monkeypatch):
+    runtime.get_probability.return_value = 0.0
+    runtime.consume_request_slot.return_value = False
+    leaderboard = FakeLeaderboard({USER_ID})
+    monkeypatch.setattr(handlers, "affection_leaderboard", leaderboard)
+    coordinator = use_random(monkeypatch, 0.29)
+    event = make_group_event("好感榜成员说话")
+
+    try:
+        async with app.test_matcher() as ctx:
+            bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+            ctx.should_call_api(
+                "send_group_msg",
+                {"group_id": GROUP_ID, "message": MessageSegment.text("模型回复")},
+                {"message_id": 123},
+            )
+            ctx.receive_event(bot, event)
+            await ctx.run()
+            await wait_until(lambda: runtime.record.await_count == 2)
+    finally:
+        await coordinator.close()
+
+    runtime.consume_request_slot.assert_not_awaited()
+    runtime.complete.assert_awaited_once()
+
+
+async def test_non_member_still_subject_to_hourly_limit(app: App, runtime, monkeypatch):
+    runtime.get_probability.return_value = 100.0
+    runtime.consume_request_slot.return_value = False
+    leaderboard = FakeLeaderboard({9999})
+    monkeypatch.setattr(handlers, "affection_leaderboard", leaderboard)
+    event = make_group_event("普通群友说话")
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.receive_event(bot, event)
+        await ctx.run()
+
+    runtime.consume_request_slot.assert_awaited_once_with(GROUP_ID)
+    runtime.complete.assert_not_awaited()
+
+
+async def test_directed_message_still_subject_to_hourly_limit(app: App, runtime, monkeypatch):
+    runtime.consume_request_slot.return_value = False
+    leaderboard = FakeLeaderboard({USER_ID})
+    monkeypatch.setattr(handlers, "affection_leaderboard", leaderboard)
+    event = make_group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text("点名")])
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_api(
+            "send_group_msg",
+            {
+                "group_id": GROUP_ID,
+                "message": "本群本小时请求次数已用完，请稍后再来。",
+            },
+            {"message_id": 123},
+        )
+        ctx.receive_event(bot, event)
+        await ctx.run()
+
+    runtime.consume_request_slot.assert_awaited_once_with(GROUP_ID)
+    runtime.complete.assert_not_awaited()
