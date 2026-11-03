@@ -12,7 +12,12 @@ from datetime import datetime, timedelta, timezone
 import aiosqlite
 import sqlite_vec
 
-from .config import RUNTIME_CONFIG_DEFAULTS, Config
+from .config import (
+    DEFAULT_AFFECTION_ENABLED,
+    DEFAULT_AFFECTION_PROBABILITY,
+    RUNTIME_CONFIG_DEFAULTS,
+    Config,
+)
 from .models import Chunk, ChunkStatus, Message
 
 logger = logging.getLogger(__name__)
@@ -43,6 +48,10 @@ _SCHEMA_STATEMENTS = (
             CHECK (probability >= 0 AND probability <= 100),
         hourly_limit INTEGER NOT NULL DEFAULT 10
             CHECK (hourly_limit >= 1 AND hourly_limit <= 10000),
+        affection_enabled INTEGER NOT NULL DEFAULT 1
+            CHECK (affection_enabled IN (0, 1)),
+        affection_probability REAL NOT NULL DEFAULT 30
+            CHECK (affection_probability >= 0 AND affection_probability <= 100),
         updated_at TEXT NOT NULL
     )
     """,
@@ -118,6 +127,8 @@ class MemoryStore:
         self._dimensions = config.group_chat_memory_embedding_dimensions
         self._default_probability = config.group_chat_memory_default_probability
         self._default_hourly_limit = config.group_chat_memory_hourly_request_limit
+        self._default_affection_enabled = DEFAULT_AFFECTION_ENABLED
+        self._default_affection_probability = DEFAULT_AFFECTION_PROBABILITY
         self._db: aiosqlite.Connection | None = None
         self._use_sqlite_vec = False
         self._lock = asyncio.Lock()
@@ -162,6 +173,7 @@ class MemoryStore:
                     for statement in _SCHEMA_STATEMENTS:
                         await tx.execute(statement)
                     await self._ensure_groups_hourly_limit(tx)
+                    await self._ensure_groups_affection_settings(tx)
                     await self._ensure_dimensions(tx)
                     if use_sqlite_vec:
                         await tx.execute(
@@ -285,6 +297,71 @@ class MemoryStore:
                     group_id,
                     self._default_probability,
                     limit,
+                    _format_timestamp(_utc_now()),
+                ),
+            )
+
+    async def get_affection_enabled(self, group_id: int) -> bool:
+        """返回当前群是否启用好感榜成员额外触发。"""
+        async with self._lock:
+            db = self._require_db()
+            cursor = await db.execute(
+                "SELECT affection_enabled FROM groups WHERE group_id = ?", (group_id,)
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        if row is None:
+            return self._default_affection_enabled
+        return bool(row["affection_enabled"])
+
+    async def set_affection_enabled(self, group_id: int, enabled: bool) -> None:
+        """启用或关闭当前群的好感榜成员额外触发。"""
+        async with self._transaction() as db:
+            await db.execute(
+                "INSERT INTO groups"
+                "(group_id, probability, hourly_limit, affection_enabled, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(group_id) DO UPDATE SET "
+                "affection_enabled = excluded.affection_enabled, "
+                "updated_at = excluded.updated_at",
+                (
+                    group_id,
+                    self._default_probability,
+                    self._default_hourly_limit,
+                    int(enabled),
+                    _format_timestamp(_utc_now()),
+                ),
+            )
+
+    async def get_affection_probability(self, group_id: int) -> float:
+        """返回当前群好感榜成员的额外触发概率。"""
+        async with self._lock:
+            db = self._require_db()
+            cursor = await db.execute(
+                "SELECT affection_probability FROM groups WHERE group_id = ?", (group_id,)
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        if row is None:
+            return self._default_affection_probability
+        return float(row["affection_probability"])
+
+    async def set_affection_probability(self, group_id: int, value: float) -> None:
+        """设置当前群好感榜成员的额外触发概率，取值必须在 0 到 100 之间。"""
+        probability = float(value)
+        if not math.isfinite(probability) or not 0.0 <= probability <= 100.0:
+            raise ValueError("好感榜触发概率必须是 0 到 100 之间的数值。")
+        async with self._transaction() as db:
+            await db.execute(
+                "INSERT INTO groups"
+                "(group_id, probability, hourly_limit, affection_probability, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(group_id) DO UPDATE SET "
+                "affection_probability = excluded.affection_probability, "
+                "updated_at = excluded.updated_at",
+                (
+                    group_id,
+                    self._default_probability,
+                    self._default_hourly_limit,
+                    probability,
                     _format_timestamp(_utc_now()),
                 ),
             )
@@ -549,6 +626,22 @@ class MemoryStore:
             await db.execute(
                 f"ALTER TABLE groups ADD COLUMN hourly_limit INTEGER NOT NULL DEFAULT "
                 f"{self._default_hourly_limit}"
+            )
+
+    async def _ensure_groups_affection_settings(self, db: aiosqlite.Connection) -> None:
+        cursor = await db.execute("PRAGMA table_info(groups)")
+        rows = await cursor.fetchall()
+        await cursor.close()
+        columns = {row["name"] for row in rows}
+        if "affection_enabled" not in columns:
+            await db.execute(
+                "ALTER TABLE groups ADD COLUMN affection_enabled INTEGER NOT NULL "
+                f"DEFAULT {int(self._default_affection_enabled)}"
+            )
+        if "affection_probability" not in columns:
+            await db.execute(
+                "ALTER TABLE groups ADD COLUMN affection_probability REAL NOT NULL "
+                f"DEFAULT {self._default_affection_probability}"
             )
 
     async def _ensure_dimensions(self, db: aiosqlite.Connection) -> None:

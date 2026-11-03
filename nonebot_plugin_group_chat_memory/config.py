@@ -30,6 +30,9 @@ DEFAULT_SYSTEM_PROMPT = (
     "- 只用中文，保持群聊里随口一说的感觉。"
 )
 
+DEFAULT_AFFECTION_ENABLED = True
+DEFAULT_AFFECTION_PROBABILITY = 30.0
+
 RUNTIME_CONFIG_DEFAULTS = {
     "chat_base_url": "",
     "chat_api_key": "",
@@ -73,8 +76,6 @@ class Config(BaseModel):
     group_chat_memory_context_max_chars: int = Field(default=6000, ge=1)
     group_chat_memory_default_probability: float = Field(default=0.0, ge=0.0, le=100.0)
     group_chat_memory_hourly_request_limit: int = Field(default=10, ge=1, le=10000)
-    group_chat_memory_affection_enabled: bool = True
-    group_chat_memory_affection_probability: float = Field(default=30.0, ge=0.0, le=100.0)
     group_chat_memory_ignored_qq: set[int] = Field(default_factory=set)
     group_chat_memory_system_prompt: str = DEFAULT_SYSTEM_PROMPT
 

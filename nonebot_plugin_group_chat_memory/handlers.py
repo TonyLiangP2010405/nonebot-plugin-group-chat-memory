@@ -37,6 +37,10 @@ GENERIC_REPLY_ERROR = "暂时无法生成回复，请稍后再试。"
 PERMISSION_DENIED = "仅 SUPERUSER 可执行此命令。"
 INVALID_PROBABILITY = "概率需为 0～100 的数字，最多一位小数。"
 INVALID_HOURLY_LIMIT = "每小时请求上限必须是 1 到 10000 的整数。"
+INVALID_AFFECTION_PROBABILITY = "好感榜触发概率需为 0～100 的数字，最多一位小数。"
+INVALID_AFFECTION_SWITCH = "开关参数只能是“开”或“关”。"
+AFFECTION_SWITCH_ON = {"开", "开启", "on", "1", "true"}
+AFFECTION_SWITCH_OFF = {"关", "关闭", "off", "0", "false"}
 RATE_LIMIT_NOTICE = "本群本小时请求次数已用完，请稍后再来。"
 PROBABILITY_PATTERN = re.compile(r"(?:100(?:\.0)?|\d{1,2}(?:\.\d)?)")
 SECRET_COMMAND_LOG_PATTERN = re.compile(r"(设置聊天密钥|设置向量密钥)\s+[^\r\n]*")
@@ -238,6 +242,12 @@ clear_matcher = on_command(
 hourly_limit_matcher = on_command(
     "每小时次数", rule=_eligible_group_message, priority=-1001, block=True
 )
+affection_probability_matcher = on_command(
+    "好感概率", rule=_eligible_group_message, priority=-1001, block=True
+)
+affection_switch_matcher = on_command(
+    "好感开关", rule=_eligible_group_message, priority=-1001, block=True
+)
 group_message_matcher = on_message(rule=_eligible_group_message, priority=-1000, block=False)
 
 
@@ -291,15 +301,64 @@ async def handle_hourly_limit(
     await hourly_limit_matcher.finish(f"已设置当前群每小时请求上限：{limit} 次")
 
 
+@affection_probability_matcher.handle()
+async def handle_affection_probability(
+    bot: Bot,
+    event: GroupMessageEvent,
+    args: Annotated[Message, CommandArg()],
+) -> None:
+    if not await SUPERUSER(bot, event):
+        await affection_probability_matcher.finish(PERMISSION_DENIED)
+
+    text = args.extract_plain_text().strip()
+    if not text:
+        probability = await store.get_affection_probability(event.group_id)
+        await affection_probability_matcher.finish(
+            f"当前群好感榜触发概率：{probability:.1f}%"
+        )
+    if PROBABILITY_PATTERN.fullmatch(text) is None:
+        await affection_probability_matcher.finish(INVALID_AFFECTION_PROBABILITY)
+
+    probability = float(text)
+    await store.set_affection_probability(event.group_id, probability)
+    await affection_probability_matcher.finish(
+        f"已设置当前群好感榜触发概率：{probability:.1f}%"
+    )
+
+
+@affection_switch_matcher.handle()
+async def handle_affection_switch(
+    bot: Bot,
+    event: GroupMessageEvent,
+    args: Annotated[Message, CommandArg()],
+) -> None:
+    if not await SUPERUSER(bot, event):
+        await affection_switch_matcher.finish(PERMISSION_DENIED)
+
+    text = args.extract_plain_text().strip().lower()
+    if not text:
+        enabled = await store.get_affection_enabled(event.group_id)
+        await affection_switch_matcher.finish(
+            f"当前群好感榜触发：{'已开启' if enabled else '已关闭'}"
+        )
+    if text in AFFECTION_SWITCH_ON:
+        await store.set_affection_enabled(event.group_id, True)
+        await affection_switch_matcher.finish("已开启当前群好感榜触发。")
+    if text in AFFECTION_SWITCH_OFF:
+        await store.set_affection_enabled(event.group_id, False)
+        await affection_switch_matcher.finish("已关闭当前群好感榜触发。")
+    await affection_switch_matcher.finish(INVALID_AFFECTION_SWITCH)
+
+
 async def _should_random_reply(event: GroupMessageEvent) -> bool:
-    """随机触发判断：好感榜成员至少按配置概率触发，其余按群概率。"""
+    """随机触发判断：好感榜成员至少按当前群配置概率触发，其余按群概率。"""
     minimum = 0.0
-    if (
-        config.group_chat_memory_affection_enabled
-        and config.group_chat_memory_affection_probability > 0
-        and await affection_leaderboard.is_member(event.group_id, event.user_id)
-    ):
-        minimum = config.group_chat_memory_affection_probability
+    if await store.get_affection_enabled(event.group_id):
+        probability = await store.get_affection_probability(event.group_id)
+        if probability > 0 and await affection_leaderboard.is_member(
+            event.group_id, event.user_id
+        ):
+            minimum = probability
     return await coordinator.should_random_reply(
         event.group_id, minimum_probability=minimum
     )

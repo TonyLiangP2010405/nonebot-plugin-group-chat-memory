@@ -165,3 +165,105 @@ async def test_leaderboard_accepts_all_ranked_members(user_id):
     leaderboard, _ = make_leaderboard(FakeService(("1001", "1002")))
 
     assert await leaderboard.is_member(20002, user_id) is True
+
+
+class TestAffectionSettings:
+    def make_config(self, tmp_path, filename: str = "affection.db"):
+        from nonebot_plugin_group_chat_memory.config import Config
+
+        return Config(
+            group_chat_memory_db_path_override=str(tmp_path / filename),
+            group_chat_memory_embedding_dimensions=4,
+        )
+
+    async def open_store(self, config):
+        from nonebot_plugin_group_chat_memory.store import MemoryStore
+
+        store = MemoryStore(config)
+        await store.open()
+        return store
+
+    async def test_defaults_are_enabled_and_thirty_percent(self, tmp_path):
+        store = await self.open_store(self.make_config(tmp_path))
+        try:
+            assert await store.get_affection_enabled(20002) is True
+            assert await store.get_affection_probability(20002) == pytest.approx(30.0)
+        finally:
+            await store.close()
+
+    async def test_settings_persist_across_reopen(self, tmp_path):
+        config = self.make_config(tmp_path)
+        store = await self.open_store(config)
+        try:
+            await store.set_affection_enabled(20002, False)
+            await store.set_affection_probability(20002, 12.5)
+        finally:
+            await store.close()
+
+        reopened = await self.open_store(config)
+        try:
+            assert await reopened.get_affection_enabled(20002) is False
+            assert await reopened.get_affection_probability(20002) == pytest.approx(12.5)
+        finally:
+            await reopened.close()
+
+    async def test_settings_are_isolated_per_group(self, tmp_path):
+        store = await self.open_store(self.make_config(tmp_path))
+        try:
+            await store.set_affection_enabled(20002, False)
+            await store.set_affection_probability(20002, 5.0)
+
+            assert await store.get_affection_enabled(20003) is True
+            assert await store.get_affection_probability(20003) == pytest.approx(30.0)
+        finally:
+            await store.close()
+
+    @pytest.mark.parametrize("value", [-1, 100.1, 101])
+    async def test_rejects_probability_outside_range(self, tmp_path, value):
+        store = await self.open_store(self.make_config(tmp_path))
+        try:
+            with pytest.raises(ValueError, match="0 到 100"):
+                await store.set_affection_probability(20002, value)
+        finally:
+            await store.close()
+
+    async def test_clear_group_keeps_affection_settings(self, tmp_path):
+        store = await self.open_store(self.make_config(tmp_path))
+        try:
+            await store.set_affection_enabled(20002, False)
+            await store.set_affection_probability(20002, 5.0)
+
+            await store.clear_group(20002)
+
+            assert await store.get_affection_enabled(20002) is False
+            assert await store.get_affection_probability(20002) == pytest.approx(5.0)
+        finally:
+            await store.close()
+
+    async def test_existing_database_gains_default_columns(self, tmp_path):
+        import sqlite3
+
+        path = tmp_path / "affection.db"
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute(
+                "CREATE TABLE groups ("
+                "group_id INTEGER PRIMARY KEY, "
+                "probability REAL NOT NULL DEFAULT 0, "
+                "updated_at TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO groups(group_id, probability, updated_at) "
+                "VALUES (20002, 12.5, 'now')"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        store = await self.open_store(self.make_config(tmp_path))
+        try:
+            assert await store.get_affection_enabled(20002) is True
+            assert await store.get_affection_probability(20002) == pytest.approx(30.0)
+            assert await store.get_probability(20002) == pytest.approx(12.5)
+        finally:
+            await store.close()
