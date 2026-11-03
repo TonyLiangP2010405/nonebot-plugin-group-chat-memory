@@ -119,6 +119,12 @@ async def runtime(monkeypatch):
     set_affection_enabled = AsyncMock()
     get_affection_probability = AsyncMock(return_value=30.0)
     set_affection_probability = AsyncMock()
+    is_always_reply = AsyncMock(return_value=False)
+    add_always_reply = AsyncMock(return_value=True)
+    remove_always_reply = AsyncMock(return_value=True)
+    clear_always_reply = AsyncMock(return_value=1)
+    list_always_reply = AsyncMock(return_value=[])
+    list_groups = AsyncMock(return_value=[])
     consume_request_slot = AsyncMock(return_value=True)
     monkeypatch.setattr(handlers.writer, "record", record)
     monkeypatch.setattr(handlers.context_builder, "build", build)
@@ -137,6 +143,12 @@ async def runtime(monkeypatch):
         handlers.store, "set_affection_probability", set_affection_probability
     )
     monkeypatch.setattr(handlers.store, "consume_request_slot", consume_request_slot)
+    monkeypatch.setattr(handlers.store, "is_always_reply", is_always_reply)
+    monkeypatch.setattr(handlers.store, "add_always_reply", add_always_reply)
+    monkeypatch.setattr(handlers.store, "remove_always_reply", remove_always_reply)
+    monkeypatch.setattr(handlers.store, "clear_always_reply", clear_always_reply)
+    monkeypatch.setattr(handlers.store, "list_always_reply", list_always_reply)
+    monkeypatch.setattr(handlers.store, "list_groups", list_groups)
     coordinator = ReplyCoordinator(handlers.store, handlers.reply)
     monkeypatch.setattr(handlers, "coordinator", coordinator)
     saved_config = {
@@ -149,6 +161,7 @@ async def runtime(monkeypatch):
         )
     }
     handlers._bots.clear()
+    handlers._private_drafts.clear()
     try:
         yield SimpleNamespace(
             record=record,
@@ -164,6 +177,12 @@ async def runtime(monkeypatch):
             get_affection_probability=get_affection_probability,
             set_affection_probability=set_affection_probability,
             consume_request_slot=consume_request_slot,
+            is_always_reply=is_always_reply,
+            add_always_reply=add_always_reply,
+            remove_always_reply=remove_always_reply,
+            clear_always_reply=clear_always_reply,
+            list_always_reply=list_always_reply,
+            list_groups=list_groups,
             coordinator=coordinator,
         )
     finally:
@@ -171,6 +190,7 @@ async def runtime(monkeypatch):
         for field, value in saved_config.items():
             setattr(handlers.config, field, value)
         handlers._bots.clear()
+        handlers._private_drafts.clear()
 
 
 @pytest.mark.parametrize("kind", ["at", "reply"])
@@ -1343,3 +1363,502 @@ async def test_directed_message_still_subject_to_hourly_limit(app: App, runtime,
 
     runtime.consume_request_slot.assert_awaited_once_with(GROUP_ID)
     runtime.complete.assert_not_awaited()
+
+
+async def test_always_reply_member_triggers_without_random_draw(app: App, runtime, monkeypatch):
+    runtime.get_probability.return_value = 0.0
+    runtime.is_always_reply.return_value = True
+    coordinator = use_random(monkeypatch, 0.99)
+    event = make_group_event("名单里的人说话")
+
+    try:
+        async with app.test_matcher() as ctx:
+            bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+            ctx.should_call_api(
+                "send_group_msg",
+                {"group_id": GROUP_ID, "message": MessageSegment.text("模型回复")},
+                {"message_id": 123},
+            )
+            ctx.receive_event(bot, event)
+            await ctx.run()
+            await wait_until(lambda: runtime.record.await_count == 2)
+    finally:
+        await coordinator.close()
+
+    runtime.is_always_reply.assert_awaited_once_with(GROUP_ID, USER_ID)
+    runtime.get_probability.assert_not_awaited()
+    runtime.consume_request_slot.assert_not_awaited()
+    runtime.complete.assert_awaited_once()
+
+
+async def test_always_reply_member_bypasses_exhausted_hourly_limit(app: App, runtime, monkeypatch):
+    runtime.is_always_reply.return_value = True
+    runtime.consume_request_slot.return_value = False
+    coordinator = use_random(monkeypatch, 1.0)
+    event = make_group_event("名单里的人说话")
+
+    try:
+        async with app.test_matcher() as ctx:
+            bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+            ctx.should_call_api(
+                "send_group_msg",
+                {"group_id": GROUP_ID, "message": MessageSegment.text("模型回复")},
+                {"message_id": 123},
+            )
+            ctx.receive_event(bot, event)
+            await ctx.run()
+            await wait_until(lambda: runtime.record.await_count == 2)
+    finally:
+        await coordinator.close()
+
+    runtime.consume_request_slot.assert_not_awaited()
+    runtime.complete.assert_awaited_once()
+
+
+async def test_always_reply_lookup_is_skipped_for_directed_message(app: App, runtime):
+    event = make_group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text("你好")])
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_api(
+            "send_group_msg",
+            {"group_id": GROUP_ID, "message": MessageSegment.text("模型回复")},
+            {"message_id": 123},
+        )
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_until(lambda: runtime.record.await_count == 2)
+
+    runtime.is_always_reply.assert_not_awaited()
+
+
+async def test_non_member_still_needs_random_draw(app: App, runtime, monkeypatch):
+    runtime.get_probability.return_value = 0.0
+    runtime.is_always_reply.return_value = False
+    coordinator = use_random(monkeypatch, 0.0)
+    event = make_group_event("名单外的人说话")
+
+    try:
+        async with app.test_matcher() as ctx:
+            bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+            ctx.receive_event(bot, event)
+            await ctx.run()
+    finally:
+        await coordinator.close()
+
+    runtime.is_always_reply.assert_awaited_once_with(GROUP_ID, USER_ID)
+    runtime.consume_request_slot.assert_not_awaited()
+    runtime.complete.assert_not_awaited()
+
+
+async def test_always_reply_list_query_lists_members(app: App, runtime):
+    runtime.list_always_reply.return_value = [(1001, "群名片"), (1002, "")]
+    event = make_group_event("/必回名单", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, "本群必回名单（2 人）：\n1001（群名片）\n1002", result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.always_reply_matcher)
+        await ctx.run()
+
+    runtime.list_always_reply.assert_awaited_once_with(GROUP_ID)
+
+
+async def test_always_reply_list_query_reports_empty(app: App, runtime):
+    runtime.list_always_reply.return_value = []
+    event = make_group_event("/必回名单", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, "本群必回名单为空。", result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.always_reply_matcher)
+        await ctx.run()
+
+
+async def test_always_reply_add_accepts_at_and_qq(app: App, runtime):
+    event = make_group_event(
+        Message(
+            [
+                MessageSegment.text("/必回名单 添加 "),
+                MessageSegment.at(USER_ID),
+                MessageSegment.text(" 2002"),
+            ]
+        ),
+        user_id=SUPERUSER_ID,
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, "已加入必回名单：2 人。", result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.always_reply_matcher)
+        await ctx.run()
+
+    assert [
+        call.args for call in runtime.add_always_reply.await_args_list
+    ] == [(GROUP_ID, USER_ID), (GROUP_ID, 2002)]
+
+
+async def test_always_reply_add_reports_existing_members(app: App, runtime):
+    runtime.add_always_reply.side_effect = [False, True]
+    event = make_group_event("/必回名单 添加 1001 1002", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, "已加入必回名单：1 人，1 人原本已在名单中。", result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.always_reply_matcher)
+        await ctx.run()
+
+
+async def test_always_reply_add_without_target_shows_usage(app: App, runtime):
+    event = make_group_event("/必回名单 添加", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, handlers.ALWAYS_REPLY_USAGE, result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.always_reply_matcher)
+        await ctx.run()
+
+    runtime.add_always_reply.assert_not_awaited()
+
+
+async def test_always_reply_remove_reports_missing_members(app: App, runtime):
+    runtime.remove_always_reply.return_value = False
+    event = make_group_event("/必回名单 删除 1001", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, "这些群友本来就不在必回名单里。", result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.always_reply_matcher)
+        await ctx.run()
+
+    runtime.remove_always_reply.assert_awaited_once_with(GROUP_ID, 1001)
+
+
+async def test_always_reply_clear_removes_all(app: App, runtime):
+    runtime.clear_always_reply.return_value = 3
+    event = make_group_event("/必回名单 清空", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, "已清空本群必回名单（3 人）。", result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.always_reply_matcher)
+        await ctx.run()
+
+    runtime.clear_always_reply.assert_awaited_once_with(GROUP_ID)
+
+
+async def test_always_reply_command_requires_superuser(app: App, runtime):
+    event = make_group_event("/必回名单 添加 1001")
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, handlers.PERMISSION_DENIED, result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.always_reply_matcher)
+        await ctx.run()
+
+    runtime.add_always_reply.assert_not_awaited()
+
+
+async def test_always_reply_unknown_action_shows_usage(app: App, runtime):
+    event = make_group_event("/必回名单 随便", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, handlers.ALWAYS_REPLY_USAGE, result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.always_reply_matcher)
+        await ctx.run()
+
+
+async def test_always_reply_command_changes_real_store_and_reply(
+    app: App, monkeypatch, tmp_path
+):
+    store = MemoryStore(
+        Config(
+            group_chat_memory_db_path_override=str(tmp_path / "always.db"),
+            group_chat_memory_embedding_dimensions=4,
+        )
+    )
+    await store.open()
+    monkeypatch.setattr(handlers, "store", store)
+    monkeypatch.setattr(handlers.writer, "record", AsyncMock())
+    monkeypatch.setattr(handlers.context_builder, "build", AsyncMock(return_value=ChatContext()))
+    monkeypatch.setattr(handlers.chat_client, "complete", AsyncMock(return_value="模型回复"))
+    coordinator = ReplyCoordinator(store, handlers.reply)
+    monkeypatch.setattr(handlers, "coordinator", coordinator)
+    handlers._bots.clear()
+
+    try:
+        async with app.test_matcher() as ctx:
+            bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+            command = make_group_event("/必回名单 添加 1001", user_id=SUPERUSER_ID)
+            ctx.should_call_send(command, "已加入必回名单：1 人。", result=None, bot=bot)
+            ctx.receive_event(bot, command)
+            await ctx.run()
+
+        assert await store.is_always_reply(GROUP_ID, 1001) is True
+        assert await store.is_always_reply(GROUP_ID, 9999) is False
+        assert await store.get_probability(GROUP_ID) == 0.0
+
+        async with app.test_matcher() as ctx:
+            bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+            ctx.should_call_api(
+                "send_group_msg",
+                {"group_id": GROUP_ID, "message": MessageSegment.text("模型回复")},
+                {"message_id": 123},
+            )
+            ctx.receive_event(bot, make_group_event("名单里的人说话"))
+            await ctx.run()
+            await wait_until(lambda: handlers.writer.record.await_count == 2)
+
+        handlers.chat_client.complete.assert_awaited_once()
+    finally:
+        await coordinator.close()
+        await store.close()
+        handlers._bots.clear()
+
+
+async def test_private_always_reply_lists_groups(app: App, runtime):
+    runtime.list_groups.return_value = [
+        (GROUP_ID, 12, "2023-11-14T22:13:20+00:00"),
+        (OTHER_GROUP_ID, 3, None),
+    ]
+    event = make_private_event(content="/必回名单", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        bot.get_group_list = AsyncMock(
+            return_value=[
+                {"group_id": GROUP_ID, "group_name": "测试群"},
+                {"group_id": OTHER_GROUP_ID, "group_name": "另一个群"},
+            ]
+        )
+        ctx.should_call_send(
+            event,
+            "请选择要设置必回名单的群：\n"
+            f"1. 测试群（{GROUP_ID}）\n"
+            f"2. 另一个群（{OTHER_GROUP_ID}）\n"
+            "回复序号或群号进行选择，回复“取消”退出。",
+            result=None,
+            bot=bot,
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.private_always_reply_matcher)
+
+    assert handlers._private_drafts[SUPERUSER_ID].groups == (GROUP_ID, OTHER_GROUP_ID)
+
+
+async def test_private_always_reply_without_groups(app: App, runtime):
+    runtime.list_groups.return_value = []
+    event = make_private_event(content="/必回名单", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, handlers.NO_KNOWN_GROUP, result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.private_always_reply_matcher)
+
+    assert handlers._private_drafts == {}
+
+
+async def test_private_always_reply_requires_superuser(app: App, runtime):
+    event = make_private_event(content="/必回名单", user_id=USER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, handlers.PERMISSION_DENIED, result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.private_always_reply_matcher)
+
+    runtime.list_groups.assert_not_awaited()
+
+
+async def test_private_selection_flow_adds_qq_numbers(app: App, runtime):
+    runtime.list_groups.return_value = [
+        (GROUP_ID, 12, "2023-11-14T22:13:20+00:00"),
+        (OTHER_GROUP_ID, 3, None),
+    ]
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        bot.get_group_list = AsyncMock(return_value=[])
+        command = make_private_event(content="/必回名单", user_id=SUPERUSER_ID)
+        ctx.should_call_send(command, "请选择要设置必回名单的群：\n"
+            f"1. {GROUP_ID}\n"
+            f"2. {OTHER_GROUP_ID}\n"
+            "回复序号或群号进行选择，回复“取消”退出。", result=None, bot=bot)
+        ctx.receive_event(bot, command)
+        await ctx.run()
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        choice = make_private_event(content="2", user_id=SUPERUSER_ID)
+        ctx.should_call_send(choice, handlers._member_prompt(OTHER_GROUP_ID), result=None, bot=bot)
+        ctx.receive_event(bot, choice)
+        ctx.should_finished(handlers.private_draft_matcher)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        answer = make_private_event(
+            content="123456789, 987654321", user_id=SUPERUSER_ID
+        )
+        ctx.should_call_send(
+            answer,
+            f"已加入群 {OTHER_GROUP_ID} 的必回名单：2 人。",
+            result=None,
+            bot=bot,
+        )
+        ctx.receive_event(bot, answer)
+        ctx.should_finished(handlers.private_draft_matcher)
+
+    assert [call.args for call in runtime.add_always_reply.await_args_list] == [
+        (OTHER_GROUP_ID, 123456789),
+        (OTHER_GROUP_ID, 987654321),
+    ]
+    assert handlers._private_drafts == {}
+
+
+async def test_private_selection_accepts_group_id(app: App, runtime):
+    runtime.list_groups.return_value = [(GROUP_ID, 12, None)]
+    handlers._private_drafts[SUPERUSER_ID] = handlers._PrivateDraft(
+        step="group",
+        expires_at=10**9,
+        groups=(GROUP_ID, OTHER_GROUP_ID),
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        event = make_private_event(content=str(OTHER_GROUP_ID), user_id=SUPERUSER_ID)
+        ctx.should_call_send(event, handlers._member_prompt(OTHER_GROUP_ID), result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.private_draft_matcher)
+
+    draft = handlers._private_drafts[SUPERUSER_ID]
+    assert draft.step == "member"
+    assert draft.group_id == OTHER_GROUP_ID
+
+
+async def test_private_selection_rejects_unknown_choice(app: App, runtime):
+    handlers._private_drafts[SUPERUSER_ID] = handlers._PrivateDraft(
+        step="group", expires_at=10**9, groups=(GROUP_ID,)
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        event = make_private_event(content="9", user_id=SUPERUSER_ID)
+        ctx.should_call_send(
+            event,
+            "没有匹配的群，请重新回复序号或群号，回复“取消”退出。",
+            result=None,
+            bot=bot,
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.private_draft_matcher)
+
+    assert handlers._private_drafts[SUPERUSER_ID].step == "group"
+
+
+async def test_private_selection_can_be_cancelled(app: App, runtime):
+    handlers._private_drafts[SUPERUSER_ID] = handlers._PrivateDraft(
+        step="group", expires_at=10**9, groups=(GROUP_ID,)
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        event = make_private_event(content="取消", user_id=SUPERUSER_ID)
+        ctx.should_call_send(event, handlers.CANCEL_NOTICE, result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.private_draft_matcher)
+
+    assert handlers._private_drafts == {}
+
+
+async def test_private_member_step_rejects_text_without_qq(app: App, runtime):
+    handlers._private_drafts[SUPERUSER_ID] = handlers._PrivateDraft(
+        step="member", expires_at=10**9, group_id=GROUP_ID
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        event = make_private_event(content="哈哈", user_id=SUPERUSER_ID)
+        ctx.should_call_send(
+            event,
+            "没识别到 QQ 号，请重新发送，回复“取消”退出。",
+            result=None,
+            bot=bot,
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.private_draft_matcher)
+
+    runtime.add_always_reply.assert_not_awaited()
+    assert handlers._private_drafts[SUPERUSER_ID].group_id == GROUP_ID
+
+
+async def test_expired_private_draft_is_ignored(app: App, runtime):
+    handlers._private_drafts[SUPERUSER_ID] = handlers._PrivateDraft(
+        step="group", expires_at=0.0, groups=(GROUP_ID,)
+    )
+    event = make_private_event(content="1", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.receive_event(bot, event)
+        await ctx.run()
+
+    assert handlers._private_drafts == {}
+
+
+async def test_plain_private_text_without_draft_is_ignored(app: App, runtime):
+    event = make_private_event(content="在吗", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.receive_event(bot, event)
+        await ctx.run()
+
+    runtime.add_always_reply.assert_not_awaited()
+
+
+async def test_pending_draft_does_not_swallow_private_commands(app: App, runtime):
+    handlers._private_drafts[SUPERUSER_ID] = handlers._PrivateDraft(
+        step="member", expires_at=10**9, group_id=GROUP_ID
+    )
+    event = make_private_event(content="/模型配置", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event,
+            "聊天地址：未配置\n"
+            "聊天模型：deepseek-v4.1-flash\n"
+            "聊天密钥：未配置\n"
+            "Embedding 密钥：未配置",
+            result=None,
+            bot=bot,
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.model_config_matcher)
+
+    assert handlers._private_drafts[SUPERUSER_ID].group_id == GROUP_ID

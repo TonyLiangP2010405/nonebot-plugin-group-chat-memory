@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Annotated
 from urllib.parse import urlparse
@@ -39,6 +41,19 @@ INVALID_PROBABILITY = "概率需为 0～100 的数字，最多一位小数。"
 INVALID_HOURLY_LIMIT = "每小时请求上限必须是 1 到 10000 的整数。"
 INVALID_AFFECTION_PROBABILITY = "好感榜触发概率需为 0～100 的数字，最多一位小数。"
 INVALID_AFFECTION_SWITCH = "开关参数只能是“开”或“关”。"
+ALWAYS_REPLY_USAGE = (
+    "用法：/必回名单｜/必回名单 添加 @群友 123456｜"
+    "/必回名单 删除 @群友｜/必回名单 清空"
+)
+ALWAYS_REPLY_ADD = {"添加", "加", "add"}
+ALWAYS_REPLY_REMOVE = {"删除", "移除", "删", "remove", "del"}
+ALWAYS_REPLY_CLEAR = {"清空", "clear"}
+CANCEL_WORDS = {"取消", "退出", "cancel", "q"}
+QQ_PATTERN = re.compile(r"\d{5,12}")
+PRIVATE_DRAFT_TTL = 300.0
+PRIVATE_GROUP_CHOICE_LIMIT = 50
+CANCEL_NOTICE = "已取消必回名单操作。"
+NO_KNOWN_GROUP = "还没有任何群的聊天记录，先在群里用一次机器人再试。"
 AFFECTION_SWITCH_ON = {"开", "开启", "on", "1", "true"}
 AFFECTION_SWITCH_OFF = {"关", "关闭", "off", "0", "false"}
 RATE_LIMIT_NOTICE = "本群本小时请求次数已用完，请稍后再来。"
@@ -120,6 +135,85 @@ async def _eligible_group_message(bot: Bot, event: GroupMessageEvent) -> bool:
     if event.user_id in {event.self_id, int(bot.self_id)}:
         return False
     return event.user_id not in config.group_chat_memory_ignored_qq
+
+
+@dataclass
+class _PrivateDraft:
+    """私聊里“选群 → 填 QQ”两步交互的临时状态。"""
+
+    step: str
+    expires_at: float
+    groups: tuple[int, ...] = ()
+    group_id: int | None = None
+
+
+_private_drafts: dict[int, _PrivateDraft] = {}
+
+
+def _private_message(event: MessageEvent) -> bool:
+    return isinstance(event, PrivateMessageEvent)
+
+
+def _looks_like_command(text: str) -> bool:
+    starts = get_driver().config.command_start or {"/"}
+    return any(start and text.startswith(start) for start in starts)
+
+
+def _pending_private_draft(event: MessageEvent) -> bool:
+    if not isinstance(event, PrivateMessageEvent):
+        return False
+    draft = _private_drafts.get(event.user_id)
+    if draft is None:
+        return False
+    if draft.expires_at <= time.monotonic():
+        _private_drafts.pop(event.user_id, None)
+        return False
+    return not _looks_like_command(event.get_plaintext().strip())
+
+
+async def _group_names(bot: Bot) -> dict[int, str]:
+    """尽力取群名；取不到时返回空表，列表里只显示群号。"""
+    try:
+        groups = await bot.get_group_list()
+    except Exception as exc:
+        logger.warning("读取群列表失败：%s", type(exc).__name__)
+        return {}
+    names: dict[int, str] = {}
+    for item in groups:
+        try:
+            names[int(item["group_id"])] = str(item.get("group_name") or "")
+        except (KeyError, TypeError, ValueError):
+            continue
+    return names
+
+
+def _group_choice_list(group_ids: tuple[int, ...], names: dict[int, str]) -> str:
+    lines = ["请选择要设置必回名单的群："]
+    for index, group_id in enumerate(group_ids, start=1):
+        name = names.get(group_id)
+        lines.append(
+            f"{index}. {name}（{group_id}）" if name else f"{index}. {group_id}"
+        )
+    lines.append("回复序号或群号进行选择，回复“取消”退出。")
+    return "\n".join(lines)
+
+
+def _member_prompt(group_id: int) -> str:
+    return (
+        f"已选择群 {group_id}。\n"
+        "请发送要加入必回名单的 QQ 号，多个用空格、逗号或换行分隔，回复“取消”退出。"
+    )
+
+
+def _select_group(draft: _PrivateDraft, text: str) -> int | None:
+    if not text.isdigit():
+        return None
+    value = int(text)
+    if value in draft.groups:
+        return value
+    if 1 <= value <= len(draft.groups):
+        return draft.groups[value - 1]
+    return None
 
 
 settings_locks: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = WeakKeyDictionary()
@@ -248,6 +342,15 @@ affection_probability_matcher = on_command(
 affection_switch_matcher = on_command(
     "好感开关", rule=_eligible_group_message, priority=-1001, block=True
 )
+always_reply_matcher = on_command(
+    "必回名单", rule=_eligible_group_message, priority=-1001, block=True
+)
+private_always_reply_matcher = on_command(
+    "必回名单", rule=_private_message, priority=-1001, block=True
+)
+private_draft_matcher = on_message(
+    rule=_pending_private_draft, priority=-1001, block=True
+)
 group_message_matcher = on_message(rule=_eligible_group_message, priority=-1000, block=False)
 
 
@@ -350,6 +453,156 @@ async def handle_affection_switch(
     await affection_switch_matcher.finish(INVALID_AFFECTION_SWITCH)
 
 
+def _always_reply_targets(args: Message) -> list[int]:
+    """从命令参数中提取目标 QQ：支持 @ 群友和直接写号码。"""
+    targets: list[int] = []
+    for segment in args:
+        if segment.type == "at":
+            qq = str(segment.data.get("qq", ""))
+            if qq.isdigit() and int(qq) not in targets:
+                targets.append(int(qq))
+        elif segment.type == "text":
+            for token in str(segment.data.get("text", "")).split():
+                if token.isdigit() and int(token) not in targets:
+                    targets.append(int(token))
+    return targets
+
+
+@always_reply_matcher.handle()
+async def handle_always_reply(
+    bot: Bot,
+    event: GroupMessageEvent,
+    args: Annotated[Message, CommandArg()],
+) -> None:
+    if not await SUPERUSER(bot, event):
+        await always_reply_matcher.finish(PERMISSION_DENIED)
+
+    parts = args.extract_plain_text().strip().split()
+    action = parts[0] if parts else ""
+    if not action:
+        members = await store.list_always_reply(event.group_id)
+        if not members:
+            await always_reply_matcher.finish("本群必回名单为空。")
+        lines = [f"本群必回名单（{len(members)} 人）："]
+        lines.extend(
+            f"{user_id}（{name}）" if name else str(user_id) for user_id, name in members
+        )
+        await always_reply_matcher.finish("\n".join(lines))
+
+    targets = _always_reply_targets(args)
+    if action in ALWAYS_REPLY_CLEAR:
+        removed = await store.clear_always_reply(event.group_id)
+        if removed == 0:
+            await always_reply_matcher.finish("本群必回名单本来就是空的。")
+        await always_reply_matcher.finish(f"已清空本群必回名单（{removed} 人）。")
+
+    if action in ALWAYS_REPLY_ADD:
+        if not targets:
+            await always_reply_matcher.finish(ALWAYS_REPLY_USAGE)
+        added = 0
+        for user_id in targets:
+            if await store.add_always_reply(event.group_id, user_id):
+                added += 1
+        skipped = len(targets) - added
+        if added == 0:
+            await always_reply_matcher.finish("这些群友已经在必回名单里了。")
+        suffix = f"，{skipped} 人原本已在名单中" if skipped else ""
+        await always_reply_matcher.finish(f"已加入必回名单：{added} 人{suffix}。")
+
+    if action in ALWAYS_REPLY_REMOVE:
+        if not targets:
+            await always_reply_matcher.finish(ALWAYS_REPLY_USAGE)
+        removed = 0
+        for user_id in targets:
+            if await store.remove_always_reply(event.group_id, user_id):
+                removed += 1
+        if removed == 0:
+            await always_reply_matcher.finish("这些群友本来就不在必回名单里。")
+        skipped = len(targets) - removed
+        suffix = f"，{skipped} 人原本就不在名单中" if skipped else ""
+        await always_reply_matcher.finish(f"已移出必回名单：{removed} 人{suffix}。")
+
+    await always_reply_matcher.finish(ALWAYS_REPLY_USAGE)
+
+
+@private_always_reply_matcher.handle()
+async def handle_private_always_reply(
+    bot: Bot,
+    event: PrivateMessageEvent,
+    args: Annotated[Message, CommandArg()],
+) -> None:
+    if not await SUPERUSER(bot, event):
+        await private_always_reply_matcher.finish(PERMISSION_DENIED)
+
+    text = args.extract_plain_text().strip()
+    if text.lower() in CANCEL_WORDS:
+        _private_drafts.pop(event.user_id, None)
+        await private_always_reply_matcher.finish(CANCEL_NOTICE)
+
+    groups = await store.list_groups()
+    if not groups:
+        await private_always_reply_matcher.finish(NO_KNOWN_GROUP)
+
+    group_ids = tuple(group_id for group_id, _, _ in groups)[
+        :PRIVATE_GROUP_CHOICE_LIMIT
+    ]
+    _private_drafts[event.user_id] = _PrivateDraft(
+        step="group",
+        expires_at=time.monotonic() + PRIVATE_DRAFT_TTL,
+        groups=group_ids,
+    )
+    names = await _group_names(bot)
+    await private_always_reply_matcher.finish(_group_choice_list(group_ids, names))
+
+
+@private_draft_matcher.handle()
+async def handle_private_draft(bot: Bot, event: PrivateMessageEvent) -> None:
+    draft = _private_drafts.get(event.user_id)
+    if draft is None:
+        await private_draft_matcher.finish()
+    if not await SUPERUSER(bot, event):
+        _private_drafts.pop(event.user_id, None)
+        await private_draft_matcher.finish(PERMISSION_DENIED)
+
+    text = event.get_plaintext().strip()
+    if text.lower() in CANCEL_WORDS:
+        _private_drafts.pop(event.user_id, None)
+        await private_draft_matcher.finish(CANCEL_NOTICE)
+
+    if draft.step == "group":
+        group_id = _select_group(draft, text)
+        if group_id is None:
+            await private_draft_matcher.finish(
+                "没有匹配的群，请重新回复序号或群号，回复“取消”退出。"
+            )
+        draft.group_id = group_id
+        draft.step = "member"
+        draft.expires_at = time.monotonic() + PRIVATE_DRAFT_TTL
+        await private_draft_matcher.finish(_member_prompt(group_id))
+
+    targets = list(dict.fromkeys(int(qq) for qq in QQ_PATTERN.findall(text)))
+    if not targets:
+        await private_draft_matcher.finish(
+            "没识别到 QQ 号，请重新发送，回复“取消”退出。"
+        )
+
+    group_id = draft.group_id
+    if group_id is None:
+        _private_drafts.pop(event.user_id, None)
+        await private_draft_matcher.finish(CANCEL_NOTICE)
+
+    added = 0
+    for user_id in targets:
+        if await store.add_always_reply(group_id, user_id):
+            added += 1
+    _private_drafts.pop(event.user_id, None)
+    skipped = len(targets) - added
+    suffix = f"，{skipped} 人原本已在名单中" if skipped else ""
+    await private_draft_matcher.finish(
+        f"已加入群 {group_id} 的必回名单：{added} 人{suffix}。"
+    )
+
+
 async def _affection_probability(event: GroupMessageEvent) -> float:
     """好感榜成员的最低触发概率；不适用时返回 0。"""
     if not await store.get_affection_enabled(event.group_id):
@@ -397,6 +650,10 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     if event.reply is not None:
         return
     if any(segment.type != "text" for segment in event.message):
+        return
+
+    if await store.is_always_reply(event.group_id, event.user_id):
+        coordinator.submit(event.group_id, memory_message, explicit=False)
         return
 
     affection_probability = await _affection_probability(event)

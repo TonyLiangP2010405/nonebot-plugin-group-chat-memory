@@ -56,6 +56,15 @@ _SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS always_reply_members (
+        group_id INTEGER NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL,
+        display_name TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (group_id, user_id)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS request_usage (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         group_id INTEGER NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE,
@@ -365,6 +374,101 @@ class MemoryStore:
                     _format_timestamp(_utc_now()),
                 ),
             )
+
+    async def is_always_reply(self, group_id: int, user_id: int) -> bool:
+        """返回成员是否在当前群的必回名单中。"""
+        async with self._lock:
+            db = self._require_db()
+            cursor = await db.execute(
+                "SELECT 1 FROM always_reply_members WHERE group_id = ? AND user_id = ?",
+                (group_id, user_id),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        return row is not None
+
+    async def add_always_reply(
+        self, group_id: int, user_id: int, display_name: str = ""
+    ) -> bool:
+        """把成员加入必回名单；返回是否为新增（已存在时只更新缓存的群名片）。"""
+        async with self._transaction() as db:
+            await self._ensure_group(db, group_id)
+            cursor = await db.execute(
+                "SELECT 1 FROM always_reply_members WHERE group_id = ? AND user_id = ?",
+                (group_id, user_id),
+            )
+            existed = await cursor.fetchone() is not None
+            await cursor.close()
+            await db.execute(
+                "INSERT INTO always_reply_members"
+                "(group_id, user_id, display_name, created_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(group_id, user_id) DO UPDATE SET "
+                "display_name = excluded.display_name",
+                (group_id, user_id, display_name, _format_timestamp(_utc_now())),
+            )
+        return not existed
+
+    async def remove_always_reply(self, group_id: int, user_id: int) -> bool:
+        """把成员移出必回名单，返回是否真的删除了记录。"""
+        async with self._transaction() as db:
+            cursor = await db.execute(
+                "DELETE FROM always_reply_members WHERE group_id = ? AND user_id = ?",
+                (group_id, user_id),
+            )
+            removed = cursor.rowcount > 0
+            await cursor.close()
+        return removed
+
+    async def clear_always_reply(self, group_id: int) -> int:
+        """清空当前群的必回名单，返回删除的人数。"""
+        async with self._transaction() as db:
+            cursor = await db.execute(
+                "DELETE FROM always_reply_members WHERE group_id = ?", (group_id,)
+            )
+            removed = cursor.rowcount
+            await cursor.close()
+        return max(int(removed or 0), 0)
+
+    async def list_always_reply(self, group_id: int) -> list[tuple[int, str]]:
+        """返回当前群必回名单的 (QQ, 群名片)，群名片优先取最近一条消息。"""
+        async with self._lock:
+            db = self._require_db()
+            cursor = await db.execute(
+                "SELECT a.user_id, COALESCE(("
+                "SELECT m.display_name FROM messages AS m "
+                "WHERE m.group_id = a.group_id AND m.user_id = a.user_id "
+                "ORDER BY m.id DESC LIMIT 1"
+                "), a.display_name, '') AS display_name "
+                "FROM always_reply_members AS a "
+                "WHERE a.group_id = ? ORDER BY a.created_at, a.user_id",
+                (group_id,),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [(int(row["user_id"]), str(row["display_name"])) for row in rows]
+
+    async def list_groups(self) -> list[tuple[int, int, str | None]]:
+        """返回插件记录过的群：(群号, 消息数, 最后一条消息时间)，最近活跃在前。"""
+        async with self._lock:
+            db = self._require_db()
+            cursor = await db.execute(
+                "SELECT g.group_id AS group_id, "
+                "(SELECT count(*) FROM messages AS m "
+                "WHERE m.group_id = g.group_id) AS messages, "
+                "(SELECT max(m.created_at) FROM messages AS m "
+                "WHERE m.group_id = g.group_id) AS last_at "
+                "FROM groups AS g ORDER BY COALESCE(last_at, '') DESC, g.group_id"
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [
+            (
+                int(row["group_id"]),
+                int(row["messages"]),
+                str(row["last_at"]) if row["last_at"] is not None else None,
+            )
+            for row in rows
+        ]
 
     async def consume_request_slot(
         self, group_id: int, now: datetime | None = None
