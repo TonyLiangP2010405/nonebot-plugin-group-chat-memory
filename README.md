@@ -80,6 +80,8 @@ COMMAND_START=["/"]
 | `GROUP_CHAT_MEMORY_CONTEXT_MAX_CHARS` | `6000` | 发送给聊天模型的上下文总字符预算，至少为 1；优先保留当前消息和最近消息。 |
 | `GROUP_CHAT_MEMORY_DEFAULT_PROBABILITY` | `0` | 新群随机回复概率，范围 0～100；已有群使用数据库中的概率。 |
 | `GROUP_CHAT_MEMORY_HOURLY_REQUEST_LIMIT` | `10` | 新群默认每小时模型请求上限，范围 1～10000；已有群可用 `/每小时次数` 修改。 |
+| `GROUP_CHAT_MEMORY_AFFECTION_ENABLED` | `true` | 是否启用“好感榜成员额外触发”。仅在已加载 `nonebot-plugin-mantou-affection` 时生效。 |
+| `GROUP_CHAT_MEMORY_AFFECTION_PROBABILITY` | `30` | 好感榜成员发言时的最低触发概率，范围 0～100；实际概率取群概率与该值的较大者。 |
 | `GROUP_CHAT_MEMORY_IGNORED_QQ` | `[]` | 完全忽略的 QQ 号 JSON 数组，例如 `[12345, 67890]`；这些账号的消息不记忆也不触发回复。 |
 | `GROUP_CHAT_MEMORY_SYSTEM_PROMPT` | 内置“馒头 + 群友口头禅”人格 | 自定义系统提示词并完全覆盖默认人格；设为空时仅使用内置的发言者区分和当前消息约束。 |
 
@@ -92,6 +94,8 @@ COMMAND_START=["/"]
 默认人格为“馒头”：Bot 以长期群友的身份说话，句子短，爱用“确实”“还真是”“坏了”“何意味”“可爱捏”这类群内口头禅，会吐槽、接梗和复读，但正经问题仍优先给准确答案。插件命令优先级为 `-1001`，群聊消息优先级为 `-1000`；@Bot 或回复 Bot 处理完成后会停止事件继续传播，避免其他 NoneBot 插件同时响应。普通群聊仍不会阻塞其他插件。
 
 每个群默认每小时最多触发 10 次模型请求，采用滚动 60 分钟窗口。点名超额会收到简短提示，随机回复超额静默跳过；消息仍写入记忆，命令和 Embedding 不消耗次数。
+
+安装并加载 `nonebot-plugin-mantou-affection` 后，好感榜（该插件默认取前 10 名）上的群友发普通文本时，触发概率至少为 `GROUP_CHAT_MEMORY_AFFECTION_PROBABILITY`（默认 30%）。若当前群的 `/回复概率` 更高，则沿用更高值；两者只做一次随机判定。好感榜读取失败或插件未加载时自动退回群概率，不影响正常聊天。榜单结果缓存 30 秒，避免每条消息都读文件。
 
 | 命令 | 权限 | 行为 |
 |---|---|---|

@@ -72,12 +72,18 @@ class ReplyCoordinator:
         self._groups: dict[int, _GroupState] = {}
         self._closing = False
 
-    async def should_random_reply(self, group_id: int) -> bool:
+    async def should_random_reply(
+        self, group_id: int, *, minimum_probability: float = 0.0
+    ) -> bool:
         """按当前群概率判断是否随机回复：0% 永不、100% 必定。
 
         概率每次从存储读取，管理命令修改后立即生效。0 与 100 的边界不消耗随机值。
+        `minimum_probability` 用于好感榜等额外加成：取群概率与该值的较大者，
+        仍然只消耗一次随机值。
         """
-        probability = await self._store.get_probability(group_id)
+        probability = max(
+            await self._store.get_probability(group_id), minimum_probability
+        )
         if probability <= 0.0:
             return False
         if probability >= 100.0:

@@ -368,6 +368,38 @@ class TestProbability:
         await store.set_probability(100, 40.0)
         assert await coordinator.should_random_reply(100) is False
 
+    async def test_minimum_probability_raises_effective_chance(
+        self, store, make_coordinator
+    ):
+        coordinator = make_coordinator(FakeReply(auto=True), random_value=lambda: 0.29)
+
+        await store.set_probability(100, 0.0)
+        assert await coordinator.should_random_reply(100, minimum_probability=30.0) is True
+
+    async def test_minimum_probability_does_not_lower_group_probability(
+        self, store, make_coordinator
+    ):
+        coordinator = make_coordinator(FakeReply(auto=True), random_value=lambda: 0.79)
+
+        await store.set_probability(100, 80.0)
+        assert await coordinator.should_random_reply(100, minimum_probability=30.0) is True
+
+    async def test_minimum_probability_boundaries_skip_random_value(
+        self, store, make_coordinator
+    ):
+        calls: list[int] = []
+
+        def random_value() -> float:
+            calls.append(1)
+            return 0.5
+
+        coordinator = make_coordinator(FakeReply(auto=True), random_value=random_value)
+
+        await store.set_probability(100, 0.0)
+        assert await coordinator.should_random_reply(100, minimum_probability=0.0) is False
+        assert await coordinator.should_random_reply(100, minimum_probability=100.0) is True
+        assert calls == []
+
 
 class TestErrorIsolation:
     async def test_failed_reply_is_logged_and_later_requests_still_run(

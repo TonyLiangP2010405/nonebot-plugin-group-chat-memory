@@ -22,6 +22,7 @@ from nonebot.exception import StopPropagation
 from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
 
+from .affection import AffectionLeaderboard
 from .api import ChatAPIError, ChatClient, EmbeddingClient
 from .config import get_settings
 from .context import ContextBuilder
@@ -104,6 +105,7 @@ async def reply(group_id: int, message: MemoryMessage) -> None:
 
 
 coordinator = ReplyCoordinator(store, reply)
+affection_leaderboard = AffectionLeaderboard()
 
 
 async def _eligible_group_message(bot: Bot, event: GroupMessageEvent) -> bool:
@@ -289,6 +291,20 @@ async def handle_hourly_limit(
     await hourly_limit_matcher.finish(f"已设置当前群每小时请求上限：{limit} 次")
 
 
+async def _should_random_reply(event: GroupMessageEvent) -> bool:
+    """随机触发判断：好感榜成员至少按配置概率触发，其余按群概率。"""
+    minimum = 0.0
+    if (
+        config.group_chat_memory_affection_enabled
+        and config.group_chat_memory_affection_probability > 0
+        and await affection_leaderboard.is_member(event.group_id, event.user_id)
+    ):
+        minimum = config.group_chat_memory_affection_probability
+    return await coordinator.should_random_reply(
+        event.group_id, minimum_probability=minimum
+    )
+
+
 @group_message_matcher.handle()
 async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     explicit_at = any(
@@ -324,7 +340,7 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     elif (
         event.reply is None
         and all(segment.type == "text" for segment in event.message)
-        and await coordinator.should_random_reply(event.group_id)
+        and await _should_random_reply(event)
         and await store.consume_request_slot(event.group_id)
     ):
         coordinator.submit(event.group_id, memory_message, explicit=False)

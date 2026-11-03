@@ -955,3 +955,152 @@ async def test_random_rate_limit_is_silent_without_model(app: App, runtime):
     runtime.record.assert_awaited_once()
     runtime.complete.assert_not_awaited()
     runtime.consume_request_slot.assert_awaited_once_with(GROUP_ID)
+
+
+class FakeLeaderboard:
+    def __init__(self, members: set[int] | None = None) -> None:
+        self.members = members or set()
+        self.calls: list[tuple[int, int]] = []
+
+    async def is_member(self, group_id: int, user_id: int) -> bool:
+        self.calls.append((group_id, user_id))
+        return user_id in self.members
+
+
+def use_random(monkeypatch, value: float) -> ReplyCoordinator:
+    coordinator = ReplyCoordinator(
+        handlers.store, handlers.reply, random_value=lambda: value
+    )
+    monkeypatch.setattr(handlers, "coordinator", coordinator)
+    return coordinator
+
+
+async def test_leaderboard_member_replies_at_thirty_percent(app: App, runtime, monkeypatch):
+    runtime.get_probability.return_value = 0.0
+    leaderboard = FakeLeaderboard({USER_ID})
+    monkeypatch.setattr(handlers, "affection_leaderboard", leaderboard)
+    coordinator = use_random(monkeypatch, 0.29)
+    event = make_group_event("好感榜成员说话")
+
+    try:
+        async with app.test_matcher() as ctx:
+            bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+            ctx.should_call_api(
+                "send_group_msg",
+                {"group_id": GROUP_ID, "message": MessageSegment.text("模型回复")},
+                {"message_id": 123},
+            )
+            ctx.receive_event(bot, event)
+            await ctx.run()
+            await wait_until(lambda: runtime.record.await_count == 2)
+    finally:
+        await coordinator.close()
+
+    assert leaderboard.calls == [(GROUP_ID, USER_ID)]
+    runtime.complete.assert_awaited_once()
+
+
+async def test_leaderboard_member_below_threshold_stays_silent(app: App, runtime, monkeypatch):
+    runtime.get_probability.return_value = 0.0
+    leaderboard = FakeLeaderboard({USER_ID})
+    monkeypatch.setattr(handlers, "affection_leaderboard", leaderboard)
+    coordinator = use_random(monkeypatch, 0.30)
+    event = make_group_event("好感榜成员说话")
+
+    try:
+        async with app.test_matcher() as ctx:
+            bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+            ctx.receive_event(bot, event)
+            await ctx.run()
+    finally:
+        await coordinator.close()
+
+    assert leaderboard.calls == [(GROUP_ID, USER_ID)]
+    runtime.consume_request_slot.assert_not_awaited()
+    runtime.complete.assert_not_awaited()
+
+
+async def test_non_leaderboard_member_keeps_group_probability(app: App, runtime, monkeypatch):
+    runtime.get_probability.return_value = 0.0
+    leaderboard = FakeLeaderboard({9999})
+    monkeypatch.setattr(handlers, "affection_leaderboard", leaderboard)
+    coordinator = use_random(monkeypatch, 0.0)
+    event = make_group_event("普通群友说话")
+
+    try:
+        async with app.test_matcher() as ctx:
+            bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+            ctx.receive_event(bot, event)
+            await ctx.run()
+    finally:
+        await coordinator.close()
+
+    assert leaderboard.calls == [(GROUP_ID, USER_ID)]
+    runtime.consume_request_slot.assert_not_awaited()
+
+
+async def test_group_probability_above_affection_boost_is_kept(app: App, runtime, monkeypatch):
+    runtime.get_probability.return_value = 100.0
+    leaderboard = FakeLeaderboard(set())
+    monkeypatch.setattr(handlers, "affection_leaderboard", leaderboard)
+    coordinator = use_random(monkeypatch, 0.99)
+    event = make_group_event("普通群友说话")
+
+    try:
+        async with app.test_matcher() as ctx:
+            bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+            ctx.should_call_api(
+                "send_group_msg",
+                {"group_id": GROUP_ID, "message": MessageSegment.text("模型回复")},
+                {"message_id": 123},
+            )
+            ctx.receive_event(bot, event)
+            await ctx.run()
+            await wait_until(lambda: runtime.record.await_count == 2)
+    finally:
+        await coordinator.close()
+
+    runtime.complete.assert_awaited_once()
+
+
+async def test_affection_boost_can_be_disabled(app: App, runtime, monkeypatch):
+    runtime.get_probability.return_value = 0.0
+    leaderboard = FakeLeaderboard({USER_ID})
+    monkeypatch.setattr(handlers, "affection_leaderboard", leaderboard)
+    monkeypatch.setattr(handlers.config, "group_chat_memory_affection_enabled", False)
+    coordinator = use_random(monkeypatch, 0.0)
+    event = make_group_event("好感榜成员说话")
+
+    try:
+        async with app.test_matcher() as ctx:
+            bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+            ctx.receive_event(bot, event)
+            await ctx.run()
+    finally:
+        await coordinator.close()
+
+    assert leaderboard.calls == []
+    runtime.consume_request_slot.assert_not_awaited()
+
+
+async def test_directed_message_skips_leaderboard_lookup(app: App, runtime, monkeypatch):
+    runtime.get_probability.return_value = 100.0
+    leaderboard = FakeLeaderboard({USER_ID})
+    monkeypatch.setattr(handlers, "affection_leaderboard", leaderboard)
+    event = make_group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text("你好")])
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_api(
+            "send_group_msg",
+            {"group_id": GROUP_ID, "message": MessageSegment.text("模型回复")},
+            {"message_id": 123},
+        )
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_until(lambda: runtime.record.await_count == 2)
+
+    assert leaderboard.calls == []
+    runtime.get_probability.assert_not_awaited()
