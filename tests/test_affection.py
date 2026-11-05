@@ -267,3 +267,60 @@ class TestAffectionSettings:
             assert await store.get_probability(20002) == pytest.approx(12.5)
         finally:
             await store.close()
+
+
+class OutOfOrderService:
+    def __init__(self, entries):
+        self.entries = entries
+
+    async def ranking(self, group_id: str):
+        return [
+            SimpleNamespace(rank=rank, profile=SimpleNamespace(user_id=user_id))
+            for rank, user_id in self.entries
+        ]
+
+
+class NoRankService:
+    def __init__(self, user_ids):
+        self.user_ids = user_ids
+
+    async def ranking(self, group_id: str):
+        return [SimpleNamespace(profile=SimpleNamespace(user_id=uid)) for uid in self.user_ids]
+
+
+async def test_top_members_returns_first_three():
+    leaderboard, _ = make_leaderboard(FakeService(("1001", "1002", "1003", "1004")))
+
+    assert await leaderboard.top_members(20002) == frozenset({1001, 1002, 1003})
+
+
+async def test_top_members_orders_by_rank_attribute():
+    service = OutOfOrderService([(3, "1003"), (1, "1001"), (2, "1002"), (4, "1004")])
+    leaderboard, _ = make_leaderboard(service)
+
+    assert await leaderboard.top_members(20002) == frozenset({1001, 1002, 1003})
+
+
+async def test_top_members_falls_back_to_list_order_without_rank():
+    leaderboard, _ = make_leaderboard(NoRankService(("1004", "1002", "1001", "1003")))
+
+    assert await leaderboard.top_members(20002) == frozenset({1004, 1002, 1001})
+
+
+async def test_top_members_shares_cache_with_membership():
+    clock = Clock()
+    service = FakeService(("1001", "1002", "1003", "1004"))
+    leaderboard = AffectionLeaderboard(
+        ttl=30.0, clock=clock, service_loader=lambda: service
+    )
+
+    await leaderboard.top_members(20002)
+    await leaderboard.is_member(20002, 1004)
+
+    assert service.calls == ["20002"]
+
+
+async def test_top_members_returns_empty_when_service_missing():
+    leaderboard = AffectionLeaderboard(service_loader=lambda: None)
+
+    assert await leaderboard.top_members(20002) == frozenset()
