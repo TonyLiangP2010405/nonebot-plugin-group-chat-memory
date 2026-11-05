@@ -81,7 +81,7 @@ COMMAND_START=["/"]
 | `GROUP_CHAT_MEMORY_DEFAULT_PROBABILITY` | `0` | 新群随机回复概率，范围 0～100；已有群使用数据库中的概率。 |
 | `GROUP_CHAT_MEMORY_HOURLY_REQUEST_LIMIT` | `10` | 新群默认每小时模型请求上限，范围 1～10000；已有群可用 `/每小时次数` 修改。 |
 | `GROUP_CHAT_MEMORY_MEME_ENABLED` | `true` | 是否启用回复附图；缺少 ID/KEY 时静默跳过，不影响文字回复。 |
-| `GROUP_CHAT_MEMORY_MEME_API_URL` | `https://cn.apihz.cn/api/img/apihzbqb.php` | 表情包检索接口，默认接口盒子官方库。 |
+| `GROUP_CHAT_MEMORY_MEME_API_URL` | `https://cn.apihz.cn/api/img/apihzbqbbaidu.php` | 表情包检索接口，默认百度通道（召回率高于官方库）；可换成 `apihzbqb.php`（官方库）或 `apihzbqbsougou.php`（搜狗）。 |
 | `GROUP_CHAT_MEMORY_IGNORED_QQ` | `[]` | 完全忽略的 QQ 号 JSON 数组，例如 `[12345, 67890]`；这些账号的消息不记忆也不触发回复。 |
 | `GROUP_CHAT_MEMORY_SYSTEM_PROMPT` | 内置“馒头 + 群友口头禅”人格 | 自定义系统提示词并完全覆盖默认人格；设为空时仅使用内置的发言者区分和当前消息约束。 |
 
