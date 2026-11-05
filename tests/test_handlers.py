@@ -2025,3 +2025,42 @@ async def test_image_failure_still_records_bot_reply(app, runtime):
         await wait_until(lambda: runtime.record.await_count == 2)
 
     runtime.record.assert_awaited()
+
+
+async def test_meme_fetch_exception_still_records_bot_reply(app, runtime):
+    runtime.meme.fetch.side_effect = RuntimeError("boom")
+    event = make_group_event("超管说话", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_api(
+            "send_group_msg",
+            {"group_id": GROUP_ID, "message": MessageSegment.text("模型回复")},
+            {"message_id": 123},
+        )
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_until(lambda: runtime.record.await_count == 2)
+
+    runtime.record.assert_awaited()
+
+
+async def test_always_reply_member_does_not_attach_meme(app, runtime, monkeypatch):
+    runtime.is_always_reply.return_value = True
+    monkeypatch.setattr(
+        handlers, "affection_leaderboard", FakeLeaderboard({USER_ID}, {USER_ID})
+    )
+    event = make_group_event("必回成员说话")
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_api(
+            "send_group_msg",
+            {"group_id": GROUP_ID, "message": MessageSegment.text("模型回复")},
+            {"message_id": 123},
+        )
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_until(lambda: runtime.record.await_count == 2)
+
+    runtime.meme.fetch.assert_not_awaited()

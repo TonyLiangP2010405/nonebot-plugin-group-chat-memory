@@ -47,14 +47,20 @@ class MemeProvider:
         self._lock = asyncio.Lock()
         self._next_at = 0.0
         self._cache: dict[str, tuple[float, str]] = {}
+        self._warned: dict[str, float] = {}
+        self._warn_ttl = 600.0
+        self._logged_unavailable = False
 
     @staticmethod
     def keyword(text: str) -> str:
-        """去掉标点与空白，只留中英文和数字，截取前 10 个字符。"""
+        """去掉标点与空白，截取前 10 个字符作为检索词。"""
         return KEYWORD_PATTERN.sub("", text)[:KEYWORD_LENGTH]
 
     async def fetch(self, text: str) -> str | None:
         if not self._enabled or not self._api_id or not self._api_key:
+            if not self._logged_unavailable:
+                logger.debug("表情包功能未启用或未配置 ID/KEY，已跳过。")
+                self._logged_unavailable = True
             return None
         keyword = self.keyword(text)
         if not keyword:
@@ -78,21 +84,31 @@ class MemeProvider:
                 response = await client.get(self._api_url, params=params)
                 response.raise_for_status()
                 data = response.json()
+            if not isinstance(data, dict) or data.get("code") != 200:
+                code = data.get("code") if isinstance(data, dict) else "invalid"
+                self._warn(keyword, f"表情包接口返回 code={code}")
+                return None
+            results = data.get("res")
+            if not isinstance(results, list) or not results:
+                self._warn(keyword, "表情包接口没有可用结果")
+                return None
+            index = min(int(self._random_value() * len(results)), len(results) - 1)
+            url = str(results[index])
         except Exception as exc:
-            logger.warning("表情包请求失败：%s", type(exc).__name__)
+            self._warn(keyword, f"表情包请求失败：{type(exc).__name__}")
             return None
 
-        if not isinstance(data, dict) or data.get("code") != 200:
-            logger.warning("表情包接口返回异常：%s", data)
-            return None
-        results = data.get("res") or []
-        if not results:
-            return None
-
-        index = min(int(self._random_value() * len(results)), len(results) - 1)
-        url = str(results[index])
         self._store_cache(keyword, url)
         return url
+
+    def _warn(self, keyword: str, message: str) -> None:
+        """同一关键词在一段时间内只记一次，避免接口挂掉时刷日志。"""
+        now = self._clock()
+        last = self._warned.get(keyword)
+        if last is not None and now - last < self._warn_ttl:
+            return
+        self._warned[keyword] = now
+        logger.warning("%s（关键词：%s）", message, keyword)
 
     async def _wait_turn(self) -> None:
         """全局串行；两次请求之间至少间隔 min_interval 秒。"""

@@ -135,3 +135,26 @@ async def test_throttle_waits_between_new_keywords():
         await provider.fetch("无语")
 
     assert clock.now == pytest.approx(6.5)
+
+
+async def test_malformed_results_returns_none():
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(API_URL).mock(
+            return_value=httpx.Response(200, json={"code": 200, "res": {"a": "b"}})
+        )
+
+        assert await make_provider().fetch("笑死") is None
+
+
+async def test_repeated_failures_log_once(caplog):
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(API_URL).mock(
+            return_value=httpx.Response(200, json={"code": 400, "msg": "调用频次过快"})
+        )
+        provider = make_provider()
+
+        await provider.fetch("笑死")
+        await provider.fetch("笑死")
+
+    messages = [record.message for record in caplog.records if "表情包" in record.message]
+    assert len(messages) == 1

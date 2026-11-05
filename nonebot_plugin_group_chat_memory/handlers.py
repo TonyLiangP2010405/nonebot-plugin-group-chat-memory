@@ -120,16 +120,12 @@ async def reply(group_id: int, message: MemoryMessage) -> None:
 
     await bot.send_group_msg(group_id=group_id, message=MessageSegment.text(response))
     if message.attach_meme:
-        image_url = await meme_provider.fetch(response)
-        if image_url:
-            try:
-                await bot.send_group_msg(
-                    group_id=group_id, message=MessageSegment.image(image_url)
-                )
-            except Exception as exc:
-                logger.warning(
-                    "群 %s 的表情包发送失败：%s", group_id, type(exc).__name__
-                )
+        try:
+            image_url = await meme_provider.fetch(response)
+            if image_url:
+                await bot.send_group_msg(group_id=group_id, message=MessageSegment.image(image_url))
+        except Exception as exc:
+            logger.warning("群 %s 的表情包发送失败：%s", group_id, type(exc).__name__)
     await writer.record(
         MemoryMessage(
             group_id=group_id,
