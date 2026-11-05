@@ -33,11 +33,16 @@ DEFAULT_SYSTEM_PROMPT = (
 DEFAULT_AFFECTION_ENABLED = True
 DEFAULT_AFFECTION_PROBABILITY = 30.0
 
+DEFAULT_APIHZ_ID = "10023437"
+DEFAULT_APIHZ_KEY = "sk1287663323"
+
 RUNTIME_CONFIG_DEFAULTS = {
     "chat_base_url": "",
     "chat_api_key": "",
     "chat_model": "deepseek-v4.1-flash",
     "embedding_api_key": "",
+    "apihz_id": DEFAULT_APIHZ_ID,
+    "apihz_key": DEFAULT_APIHZ_KEY,
 }
 
 
@@ -103,6 +108,10 @@ class Config(BaseModel):
                 self.group_chat_memory_chat_model = value
             elif key == "embedding_api_key":
                 self.group_chat_memory_embedding_api_key = SecretStr(value)
+            elif key == "apihz_id":
+                self.group_chat_memory_apihz_id = value
+            elif key == "apihz_key":
+                self.group_chat_memory_apihz_key = SecretStr(value)
 
     def require_chat_config(self) -> None:
         """检查聊天模型配置，仅在真正调用聊天功能时使用。"""

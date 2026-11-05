@@ -74,18 +74,27 @@ embedding_client = EmbeddingClient(config)
 writer = MemoryWriter(config, store, embedding_client)
 context_builder = ContextBuilder(config, store, embedding_client)
 chat_client = ChatClient(config)
-meme_provider = MemeProvider(
-    enabled=config.group_chat_memory_meme_enabled,
-    api_url=config.group_chat_memory_meme_api_url,
-    api_id=config.group_chat_memory_apihz_id,
-    api_key=config.group_chat_memory_apihz_key.get_secret_value(),
-)
+meme_provider: MemeProvider
+
+
+def _refresh_meme_provider() -> None:
+    global meme_provider
+    meme_provider = MemeProvider(
+        enabled=config.group_chat_memory_meme_enabled,
+        api_url=config.group_chat_memory_meme_api_url,
+        api_id=config.group_chat_memory_apihz_id,
+        api_key=config.group_chat_memory_apihz_key.get_secret_value(),
+    )
+
+
+_refresh_meme_provider()
 _bots: dict[int, Bot] = {}
 
 
 async def startup() -> None:
     await store.open()
     config.apply_runtime_config(await store.get_runtime_config())
+    _refresh_meme_provider()
     writer.start()
 
 
@@ -248,16 +257,22 @@ async def apply_setting(key: str, value: str) -> None:
             "chat_api_key": config.group_chat_memory_chat_api_key.get_secret_value(),
             "chat_model": config.group_chat_memory_chat_model,
             "embedding_api_key": config.group_chat_memory_embedding_api_key.get_secret_value(),
+            "apihz_id": config.group_chat_memory_apihz_id,
+            "apihz_key": config.group_chat_memory_apihz_key.get_secret_value(),
         }
         values[key] = value
         await store.set_runtime_config(key, value)
         config.apply_runtime_config(values)
+        if key in {"apihz_id", "apihz_key"}:
+            _refresh_meme_provider()
 
 
 chat_url_matcher = on_command("设置聊天地址", priority=-1001, block=True)
 chat_key_matcher = on_command("设置聊天密钥", priority=-1001, block=True)
 chat_model_matcher = on_command("设置聊天模型", priority=-1001, block=True)
 embedding_key_matcher = on_command("设置向量密钥", priority=-1001, block=True)
+meme_id_matcher = on_command("设置表情包ID", priority=-1001, block=True)
+meme_key_matcher = on_command("设置表情包密钥", priority=-1001, block=True)
 model_config_matcher = on_command("模型配置", priority=-1001, block=True)
 
 
@@ -288,6 +303,8 @@ async def _handle_setting(matcher, bot: Bot, event: MessageEvent, args: Message,
         await matcher.finish("配置参数不能为空。")
     if key == "chat_base_url" and not _valid_http_url(value):
         await matcher.finish("聊天 API 地址需为有效的 http(s) URL。")
+    if key == "apihz_id" and not value.isdigit():
+        await matcher.finish("接口 ID 必须是数字。")
     try:
         await apply_setting(key, value)
     except Exception as exc:
@@ -324,6 +341,20 @@ async def handle_embedding_key(
     await _handle_setting(embedding_key_matcher, bot, event, args, "embedding_api_key")
 
 
+@meme_id_matcher.handle()
+async def handle_meme_id(
+    bot: Bot, event: MessageEvent, args: Annotated[Message, CommandArg()]
+) -> None:
+    await _handle_setting(meme_id_matcher, bot, event, args, "apihz_id")
+
+
+@meme_key_matcher.handle()
+async def handle_meme_key(
+    bot: Bot, event: MessageEvent, args: Annotated[Message, CommandArg()]
+) -> None:
+    await _handle_setting(meme_key_matcher, bot, event, args, "apihz_key")
+
+
 @model_config_matcher.handle()
 async def handle_model_config(bot: Bot, event: MessageEvent) -> None:
     if not await SUPERUSER(bot, event):
@@ -337,7 +368,9 @@ async def handle_model_config(bot: Bot, event: MessageEvent) -> None:
         f"聊天模型：{config.group_chat_memory_chat_model}\n"
         f"聊天密钥：{status(config.group_chat_memory_chat_api_key.get_secret_value())}\n"
         "Embedding 密钥："
-        f"{status(config.group_chat_memory_embedding_api_key.get_secret_value())}"
+        f"{status(config.group_chat_memory_embedding_api_key.get_secret_value())}\n"
+        f"接口 ID：{config.group_chat_memory_apihz_id or '未配置'}\n"
+        f"接口密钥：{status(config.group_chat_memory_apihz_key.get_secret_value())}"
     )
 
 

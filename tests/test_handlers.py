@@ -161,6 +161,8 @@ async def runtime(monkeypatch):
             "group_chat_memory_chat_api_key",
             "group_chat_memory_chat_model",
             "group_chat_memory_embedding_api_key",
+            "group_chat_memory_apihz_id",
+            "group_chat_memory_apihz_key",
         )
     }
     handlers._bots.clear()
@@ -793,7 +795,9 @@ async def test_model_config_query_masks_both_secrets(app: App, runtime):
         "聊天地址：https://chat.example.com/v1\n"
         "聊天模型：deepseek-v4.1-flash\n"
         "聊天密钥：已配置（****）\n"
-        "Embedding 密钥：已配置（****）"
+        "Embedding 密钥：已配置（****）\n"
+        "接口 ID：10023437\n"
+        "接口密钥：已配置（****）"
     )
 
     async with app.test_matcher() as ctx:
@@ -1863,7 +1867,9 @@ async def test_pending_draft_does_not_swallow_private_commands(app: App, runtime
             "聊天地址：未配置\n"
             "聊天模型：deepseek-v4.1-flash\n"
             "聊天密钥：未配置\n"
-            "Embedding 密钥：未配置",
+            "Embedding 密钥：未配置\n"
+            "接口 ID：10023437\n"
+            "接口密钥：已配置（****）",
             result=None,
             bot=bot,
         )
@@ -2064,3 +2070,54 @@ async def test_always_reply_member_does_not_attach_meme(app, runtime, monkeypatc
         await wait_until(lambda: runtime.record.await_count == 2)
 
     runtime.meme.fetch.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("command", "key", "value"),
+    [
+        ("/设置表情包ID 10023437", "apihz_id", "10023437"),
+        ("/设置表情包密钥 sk-new-key", "apihz_key", "sk-new-key"),
+    ],
+)
+async def test_meme_credentials_are_set_by_private_command(
+    app, runtime, monkeypatch, command, key, value
+):
+    setter = AsyncMock()
+    monkeypatch.setattr(handlers.store, "set_runtime_config", setter)
+    event = make_private_event(content=command, user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, "模型配置已更新。", result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        await ctx.run()
+
+    setter.assert_awaited_once_with(key, value)
+
+
+async def test_meme_id_must_be_numeric(app, runtime, monkeypatch):
+    setter = AsyncMock()
+    monkeypatch.setattr(handlers.store, "set_runtime_config", setter)
+    event = make_private_event(content="/设置表情包ID abc", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, "接口 ID 必须是数字。", result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        await ctx.run()
+
+    setter.assert_not_awaited()
+
+
+async def test_meme_credentials_reject_group_chat(app, runtime, monkeypatch):
+    setter = AsyncMock()
+    monkeypatch.setattr(handlers.store, "set_runtime_config", setter)
+    event = make_group_event("/设置表情包ID 10023437", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, "请在私聊中设置模型配置。", result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        await ctx.run()
+
+    setter.assert_not_awaited()

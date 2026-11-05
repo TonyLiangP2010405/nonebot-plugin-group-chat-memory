@@ -111,3 +111,21 @@ async def test_apply_runtime_config_ignores_unknown_values(tmp_path):
 
     assert config.group_chat_memory_chat_timeout == 60.0
     assert not hasattr(config, "unexpected")
+
+
+async def test_apply_runtime_config_sets_apihz_defaults(tmp_path):
+    config = make_config(tmp_path)
+
+    config.apply_runtime_config({})
+
+    assert config.group_chat_memory_apihz_id == "10023437"
+    assert config.group_chat_memory_apihz_key.get_secret_value() == "sk1287663323"
+
+
+async def test_apply_runtime_config_overrides_apihz(tmp_path):
+    config = make_config(tmp_path)
+
+    config.apply_runtime_config({"apihz_id": "42", "apihz_key": "new-key"})
+
+    assert config.group_chat_memory_apihz_id == "42"
+    assert config.group_chat_memory_apihz_key.get_secret_value() == "new-key"
