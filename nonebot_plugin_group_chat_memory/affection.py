@@ -45,9 +45,7 @@ class AffectionLeaderboard:
         ordered, _ = await self._ranking(group_id)
         return frozenset(ordered[:limit])
 
-    async def is_top_member(
-        self, group_id: int, user_id: int, limit: int = 3
-    ) -> bool:
+    async def is_top_member(self, group_id: int, user_id: int, limit: int = 3) -> bool:
         """该用户是否在本群好感榜前 `limit` 名内。"""
         return user_id in await self.top_members(group_id, limit)
 

@@ -126,6 +126,9 @@ async def runtime(monkeypatch):
     list_always_reply = AsyncMock(return_value=[])
     list_groups = AsyncMock(return_value=[])
     consume_request_slot = AsyncMock(return_value=True)
+    meme = AsyncMock()
+    meme.fetch.return_value = "https://img/reply.png"
+    monkeypatch.setattr(handlers, "meme_provider", meme)
     monkeypatch.setattr(handlers.writer, "record", record)
     monkeypatch.setattr(handlers.context_builder, "build", build)
     monkeypatch.setattr(handlers.chat_client, "complete", complete)
@@ -184,6 +187,7 @@ async def runtime(monkeypatch):
             list_always_reply=list_always_reply,
             list_groups=list_groups,
             coordinator=coordinator,
+            meme=meme,
         )
     finally:
         await coordinator.close()
@@ -1002,13 +1006,18 @@ async def test_random_rate_limit_is_silent_without_model(app: App, runtime):
 
 
 class FakeLeaderboard:
-    def __init__(self, members: set[int] | None = None) -> None:
+    def __init__(self, members: set[int] | None = None, top: set[int] | None = None) -> None:
         self.members = members or set()
+        self.top = top or set()
         self.calls: list[tuple[int, int]] = []
 
     async def is_member(self, group_id: int, user_id: int) -> bool:
         self.calls.append((group_id, user_id))
         return user_id in self.members
+
+    async def is_top_member(self, group_id: int, user_id: int, limit: int = 3) -> bool:
+        self.calls.append((group_id, user_id))
+        return user_id in self.top
 
 
 def use_random(monkeypatch, value: float) -> ReplyCoordinator:
@@ -1040,7 +1049,7 @@ async def test_leaderboard_member_replies_at_thirty_percent(app: App, runtime, m
     finally:
         await coordinator.close()
 
-    assert leaderboard.calls == [(GROUP_ID, USER_ID)]
+    assert leaderboard.calls == [(GROUP_ID, USER_ID), (GROUP_ID, USER_ID)]
     runtime.complete.assert_awaited_once()
 
 
@@ -1862,3 +1871,157 @@ async def test_pending_draft_does_not_swallow_private_commands(app: App, runtime
         ctx.should_finished(handlers.model_config_matcher)
 
     assert handlers._private_drafts[SUPERUSER_ID].group_id == GROUP_ID
+
+
+async def test_superuser_triggers_without_draw_and_attaches_meme(app, runtime, monkeypatch):
+    runtime.get_probability.return_value = 0.0
+    coordinator = use_random(monkeypatch, 0.99)
+    event = make_group_event("超管说话", user_id=SUPERUSER_ID)
+
+    try:
+        async with app.test_matcher() as ctx:
+            bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+            ctx.should_call_api(
+                "send_group_msg",
+                {"group_id": GROUP_ID, "message": MessageSegment.text("模型回复")},
+                {"message_id": 123},
+            )
+            ctx.should_call_api(
+                "send_group_msg",
+                {
+                    "group_id": GROUP_ID,
+                    "message": MessageSegment.image("https://img/reply.png"),
+                },
+                {"message_id": 124},
+            )
+            ctx.receive_event(bot, event)
+            await ctx.run()
+            await wait_until(lambda: runtime.record.await_count == 2)
+    finally:
+        await coordinator.close()
+
+    runtime.meme.fetch.assert_awaited_once_with("模型回复")
+    runtime.consume_request_slot.assert_not_awaited()
+
+
+async def test_top_three_member_attaches_meme(app, runtime, monkeypatch):
+    runtime.get_probability.return_value = 0.0
+    monkeypatch.setattr(
+        handlers, "affection_leaderboard", FakeLeaderboard({USER_ID}, {USER_ID})
+    )
+    coordinator = use_random(monkeypatch, 0.29)
+    event = make_group_event("前三说话")
+
+    try:
+        async with app.test_matcher() as ctx:
+            bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+            ctx.should_call_api(
+                "send_group_msg",
+                {"group_id": GROUP_ID, "message": MessageSegment.text("模型回复")},
+                {"message_id": 123},
+            )
+            ctx.should_call_api(
+                "send_group_msg",
+                {
+                    "group_id": GROUP_ID,
+                    "message": MessageSegment.image("https://img/reply.png"),
+                },
+                {"message_id": 124},
+            )
+            ctx.receive_event(bot, event)
+            await ctx.run()
+            await wait_until(lambda: runtime.record.await_count == 2)
+    finally:
+        await coordinator.close()
+
+    runtime.meme.fetch.assert_awaited_once_with("模型回复")
+
+
+async def test_fourth_affection_member_does_not_attach_meme(app, runtime, monkeypatch):
+    runtime.get_probability.return_value = 0.0
+    monkeypatch.setattr(
+        handlers, "affection_leaderboard", FakeLeaderboard({USER_ID}, set())
+    )
+    coordinator = use_random(monkeypatch, 0.29)
+    event = make_group_event("榜内第四说话")
+
+    try:
+        async with app.test_matcher() as ctx:
+            bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+            ctx.should_call_api(
+                "send_group_msg",
+                {"group_id": GROUP_ID, "message": MessageSegment.text("模型回复")},
+                {"message_id": 123},
+            )
+            ctx.receive_event(bot, event)
+            await ctx.run()
+            await wait_until(lambda: runtime.record.await_count == 2)
+    finally:
+        await coordinator.close()
+
+    runtime.meme.fetch.assert_not_awaited()
+
+
+async def test_top_three_with_affection_disabled_does_not_attach_meme(
+    app, runtime, monkeypatch
+):
+    runtime.get_probability.return_value = 100.0
+    runtime.get_affection_enabled.return_value = False
+    monkeypatch.setattr(
+        handlers, "affection_leaderboard", FakeLeaderboard({USER_ID}, {USER_ID})
+    )
+    event = make_group_event("前三说话")
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_api(
+            "send_group_msg",
+            {"group_id": GROUP_ID, "message": MessageSegment.text("模型回复")},
+            {"message_id": 123},
+        )
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_until(lambda: runtime.record.await_count == 2)
+
+    runtime.meme.fetch.assert_not_awaited()
+
+
+async def test_directed_message_does_not_attach_meme(app, runtime, monkeypatch):
+    runtime.get_probability.return_value = 100.0
+    monkeypatch.setattr(
+        handlers, "affection_leaderboard", FakeLeaderboard({USER_ID}, {USER_ID})
+    )
+    event = make_group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text("点名")])
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_api(
+            "send_group_msg",
+            {"group_id": GROUP_ID, "message": MessageSegment.text("模型回复")},
+            {"message_id": 123},
+        )
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_until(lambda: runtime.record.await_count == 2)
+
+    runtime.meme.fetch.assert_not_awaited()
+
+
+async def test_image_failure_still_records_bot_reply(app, runtime):
+    runtime.meme.fetch.return_value = None
+    event = make_group_event("超管说话", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_api(
+            "send_group_msg",
+            {"group_id": GROUP_ID, "message": MessageSegment.text("模型回复")},
+            {"message_id": 123},
+        )
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_until(lambda: runtime.record.await_count == 2)
+
+    runtime.record.assert_awaited()

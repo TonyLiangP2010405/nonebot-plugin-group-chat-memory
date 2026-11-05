@@ -19,6 +19,7 @@ class Message(BaseModel):
     text: str
     created_at: datetime = Field(default_factory=_utc_now)
     is_bot: bool = False
+    attach_meme: bool = False
 
 
 class ChunkStatus(str, Enum):

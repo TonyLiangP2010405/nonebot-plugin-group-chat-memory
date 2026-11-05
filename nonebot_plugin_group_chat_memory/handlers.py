@@ -28,6 +28,7 @@ from .affection import AffectionLeaderboard
 from .api import ChatAPIError, ChatClient, EmbeddingClient
 from .config import get_settings
 from .context import ContextBuilder
+from .meme import MemeProvider
 from .memory import MemoryWriter
 from .models import Message as MemoryMessage
 from .replies import ReplyCoordinator
@@ -73,6 +74,12 @@ embedding_client = EmbeddingClient(config)
 writer = MemoryWriter(config, store, embedding_client)
 context_builder = ContextBuilder(config, store, embedding_client)
 chat_client = ChatClient(config)
+meme_provider = MemeProvider(
+    enabled=config.group_chat_memory_meme_enabled,
+    api_url=config.group_chat_memory_meme_api_url,
+    api_id=config.group_chat_memory_apihz_id,
+    api_key=config.group_chat_memory_apihz_key.get_secret_value(),
+)
 _bots: dict[int, Bot] = {}
 
 
@@ -112,6 +119,17 @@ async def reply(group_id: int, message: MemoryMessage) -> None:
         return
 
     await bot.send_group_msg(group_id=group_id, message=MessageSegment.text(response))
+    if message.attach_meme:
+        image_url = await meme_provider.fetch(response)
+        if image_url:
+            try:
+                await bot.send_group_msg(
+                    group_id=group_id, message=MessageSegment.image(image_url)
+                )
+            except Exception as exc:
+                logger.warning(
+                    "群 %s 的表情包发送失败：%s", group_id, type(exc).__name__
+                )
     await writer.record(
         MemoryMessage(
             group_id=group_id,
@@ -656,6 +674,11 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         coordinator.submit(event.group_id, memory_message, explicit=False)
         return
 
+    if await SUPERUSER(bot, event):
+        memory_message.attach_meme = True
+        coordinator.submit(event.group_id, memory_message, explicit=False)
+        return
+
     affection_probability = await _affection_probability(event)
     if not await coordinator.should_random_reply(
         event.group_id, minimum_probability=affection_probability
@@ -665,6 +688,10 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         event.group_id
     ):
         return
+    if affection_probability > 0 and await affection_leaderboard.is_top_member(
+        event.group_id, event.user_id
+    ):
+        memory_message.attach_meme = True
     coordinator.submit(event.group_id, memory_message, explicit=False)
 
 
