@@ -119,6 +119,8 @@ async def runtime(monkeypatch):
     set_affection_enabled = AsyncMock()
     get_affection_probability = AsyncMock(return_value=30.0)
     set_affection_probability = AsyncMock()
+    get_superuser_always_reply = AsyncMock(return_value=True)
+    set_superuser_always_reply = AsyncMock()
     is_always_reply = AsyncMock(return_value=False)
     add_always_reply = AsyncMock(return_value=True)
     remove_always_reply = AsyncMock(return_value=True)
@@ -144,6 +146,12 @@ async def runtime(monkeypatch):
     )
     monkeypatch.setattr(
         handlers.store, "set_affection_probability", set_affection_probability
+    )
+    monkeypatch.setattr(
+        handlers.store, "get_superuser_always_reply", get_superuser_always_reply
+    )
+    monkeypatch.setattr(
+        handlers.store, "set_superuser_always_reply", set_superuser_always_reply
     )
     monkeypatch.setattr(handlers.store, "consume_request_slot", consume_request_slot)
     monkeypatch.setattr(handlers.store, "is_always_reply", is_always_reply)
@@ -181,6 +189,8 @@ async def runtime(monkeypatch):
             set_affection_enabled=set_affection_enabled,
             get_affection_probability=get_affection_probability,
             set_affection_probability=set_affection_probability,
+            get_superuser_always_reply=get_superuser_always_reply,
+            set_superuser_always_reply=set_superuser_always_reply,
             consume_request_slot=consume_request_slot,
             is_always_reply=is_always_reply,
             add_always_reply=add_always_reply,
@@ -1260,6 +1270,91 @@ async def test_affection_switch_rejects_unknown_value(app: App, runtime):
         ctx.should_finished(handlers.affection_switch_matcher)
 
     runtime.set_affection_enabled.assert_not_awaited()
+
+
+async def test_superuser_reply_switch_query_reports_disabled_state(app: App, runtime):
+    runtime.get_superuser_always_reply.return_value = False
+    event = make_group_event("/超管必回", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, "当前群 SUPERUSER 必定触发：已关闭", result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.superuser_reply_matcher)
+
+    runtime.get_superuser_always_reply.assert_awaited_once_with(GROUP_ID)
+    runtime.set_superuser_always_reply.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("value", "enabled", "reply"),
+    [
+        ("开", True, "已开启当前群 SUPERUSER 必定触发。"),
+        ("ON", True, "已开启当前群 SUPERUSER 必定触发。"),
+        ("关", False, "已关闭当前群 SUPERUSER 必定触发。"),
+        ("off", False, "已关闭当前群 SUPERUSER 必定触发。"),
+    ],
+)
+async def test_superuser_reply_switch_setting(app: App, runtime, value, enabled, reply):
+    event = make_group_event(f"/超管必回 {value}", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, reply, result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.superuser_reply_matcher)
+
+    runtime.set_superuser_always_reply.assert_awaited_once_with(GROUP_ID, enabled)
+
+
+async def test_superuser_reply_switch_rejects_unknown_value(app: App, runtime):
+    event = make_group_event("/超管必回 可能吧", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, "开关参数只能是“开”或“关”。", result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.superuser_reply_matcher)
+
+    runtime.set_superuser_always_reply.assert_not_awaited()
+
+
+async def test_superuser_reply_switch_requires_superuser(app: App, runtime):
+    event = make_group_event("/超管必回 关", user_id=USER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, handlers.PERMISSION_DENIED, result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.superuser_reply_matcher)
+
+    runtime.set_superuser_always_reply.assert_not_awaited()
+
+
+async def test_superuser_switch_off_falls_back_to_group_probability(
+    app: App, runtime, monkeypatch
+):
+    runtime.get_superuser_always_reply.return_value = False
+    runtime.get_probability.return_value = 0.0
+    coordinator = use_random(monkeypatch, 0.0)
+    event = make_group_event("超管说话", user_id=SUPERUSER_ID)
+
+    try:
+        async with app.test_matcher() as ctx:
+            bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+            ctx.receive_event(bot, event)
+            await ctx.run()
+            await wait_until(lambda: runtime.record.await_count == 1)
+    finally:
+        await coordinator.close()
+
+    runtime.get_superuser_always_reply.assert_awaited_once_with(GROUP_ID)
+    runtime.complete.assert_not_awaited()
+    runtime.meme.fetch.assert_not_awaited()
 
 
 async def test_affection_command_changes_real_store_and_reply(app: App, monkeypatch, tmp_path):

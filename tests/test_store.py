@@ -214,6 +214,31 @@ class TestProbability:
             await second.close()
 
 
+class TestSuperuserReply:
+    async def test_new_group_defaults_to_enabled(self, store):
+        assert await store.get_superuser_always_reply(100) is True
+
+    async def test_set_and_get_superuser_always_reply(self, store):
+        await store.set_superuser_always_reply(100, False)
+
+        assert await store.get_superuser_always_reply(100) is False
+        assert await store.get_superuser_always_reply(200) is True
+
+    async def test_superuser_reply_survives_restart(self, tmp_path):
+        config = make_config(tmp_path)
+        first = await open_store(config)
+        try:
+            await first.set_superuser_always_reply(100, False)
+        finally:
+            await first.close()
+
+        second = await open_store(config)
+        try:
+            assert await second.get_superuser_always_reply(100) is False
+        finally:
+            await second.close()
+
+
 class TestChunks:
     async def test_insufficient_messages_returns_none(self, store):
         for index in range(2):

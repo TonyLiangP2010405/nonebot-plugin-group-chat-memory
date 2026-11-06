@@ -42,6 +42,7 @@ INVALID_PROBABILITY = "概率需为 0～100 的数字，最多一位小数。"
 INVALID_HOURLY_LIMIT = "每小时请求上限必须是 1 到 10000 的整数。"
 INVALID_AFFECTION_PROBABILITY = "好感榜触发概率需为 0～100 的数字，最多一位小数。"
 INVALID_AFFECTION_SWITCH = "开关参数只能是“开”或“关”。"
+INVALID_SUPERUSER_REPLY_SWITCH = "开关参数只能是“开”或“关”。"
 ALWAYS_REPLY_USAGE = (
     "用法：/必回名单｜/必回名单 添加 @群友 123456｜"
     "/必回名单 删除 @群友｜/必回名单 清空"
@@ -389,6 +390,9 @@ affection_probability_matcher = on_command(
 affection_switch_matcher = on_command(
     "好感开关", rule=_eligible_group_message, priority=-1001, block=True
 )
+superuser_reply_matcher = on_command(
+    "超管必回", rule=_eligible_group_message, priority=-1001, block=True
+)
 always_reply_matcher = on_command(
     "必回名单", rule=_eligible_group_message, priority=-1001, block=True
 )
@@ -498,6 +502,30 @@ async def handle_affection_switch(
         await store.set_affection_enabled(event.group_id, False)
         await affection_switch_matcher.finish("已关闭当前群好感榜触发。")
     await affection_switch_matcher.finish(INVALID_AFFECTION_SWITCH)
+
+
+@superuser_reply_matcher.handle()
+async def handle_superuser_reply_switch(
+    bot: Bot,
+    event: GroupMessageEvent,
+    args: Annotated[Message, CommandArg()],
+) -> None:
+    if not await SUPERUSER(bot, event):
+        await superuser_reply_matcher.finish(PERMISSION_DENIED)
+
+    text = args.extract_plain_text().strip().lower()
+    if not text:
+        enabled = await store.get_superuser_always_reply(event.group_id)
+        await superuser_reply_matcher.finish(
+            f"当前群 SUPERUSER 必定触发：{'已开启' if enabled else '已关闭'}"
+        )
+    if text in AFFECTION_SWITCH_ON:
+        await store.set_superuser_always_reply(event.group_id, True)
+        await superuser_reply_matcher.finish("已开启当前群 SUPERUSER 必定触发。")
+    if text in AFFECTION_SWITCH_OFF:
+        await store.set_superuser_always_reply(event.group_id, False)
+        await superuser_reply_matcher.finish("已关闭当前群 SUPERUSER 必定触发。")
+    await superuser_reply_matcher.finish(INVALID_SUPERUSER_REPLY_SWITCH)
 
 
 def _always_reply_targets(args: Message) -> list[int]:
@@ -703,7 +731,9 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         coordinator.submit(event.group_id, memory_message, explicit=False)
         return
 
-    if await SUPERUSER(bot, event):
+    if await SUPERUSER(bot, event) and await store.get_superuser_always_reply(
+        event.group_id
+    ):
         memory_message.attach_meme = True
         coordinator.submit(event.group_id, memory_message, explicit=False)
         return

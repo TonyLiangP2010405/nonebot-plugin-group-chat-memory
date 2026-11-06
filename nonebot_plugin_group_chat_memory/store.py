@@ -15,6 +15,7 @@ import sqlite_vec
 from .config import (
     DEFAULT_AFFECTION_ENABLED,
     DEFAULT_AFFECTION_PROBABILITY,
+    DEFAULT_SUPERUSER_ALWAYS_REPLY,
     RUNTIME_CONFIG_DEFAULTS,
     Config,
 )
@@ -52,6 +53,8 @@ _SCHEMA_STATEMENTS = (
             CHECK (affection_enabled IN (0, 1)),
         affection_probability REAL NOT NULL DEFAULT 30
             CHECK (affection_probability >= 0 AND affection_probability <= 100),
+        superuser_always_reply INTEGER NOT NULL DEFAULT 1
+            CHECK (superuser_always_reply IN (0, 1)),
         updated_at TEXT NOT NULL
     )
     """,
@@ -138,6 +141,7 @@ class MemoryStore:
         self._default_hourly_limit = config.group_chat_memory_hourly_request_limit
         self._default_affection_enabled = DEFAULT_AFFECTION_ENABLED
         self._default_affection_probability = DEFAULT_AFFECTION_PROBABILITY
+        self._default_superuser_always_reply = DEFAULT_SUPERUSER_ALWAYS_REPLY
         self._db: aiosqlite.Connection | None = None
         self._use_sqlite_vec = False
         self._lock = asyncio.Lock()
@@ -183,6 +187,7 @@ class MemoryStore:
                         await tx.execute(statement)
                     await self._ensure_groups_hourly_limit(tx)
                     await self._ensure_groups_affection_settings(tx)
+                    await self._ensure_groups_superuser_reply(tx)
                     await self._ensure_dimensions(tx)
                     if use_sqlite_vec:
                         await tx.execute(
@@ -371,6 +376,38 @@ class MemoryStore:
                     self._default_probability,
                     self._default_hourly_limit,
                     probability,
+                    _format_timestamp(_utc_now()),
+                ),
+            )
+
+    async def get_superuser_always_reply(self, group_id: int) -> bool:
+        """返回当前群是否让 SUPERUSER 的普通文本必定触发回复。"""
+        async with self._lock:
+            db = self._require_db()
+            cursor = await db.execute(
+                "SELECT superuser_always_reply FROM groups WHERE group_id = ?",
+                (group_id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        if row is None:
+            return self._default_superuser_always_reply
+        return bool(row["superuser_always_reply"])
+
+    async def set_superuser_always_reply(self, group_id: int, enabled: bool) -> None:
+        """启用或关闭当前群 SUPERUSER 的必定触发。"""
+        async with self._transaction() as db:
+            await db.execute(
+                "INSERT INTO groups"
+                "(group_id, probability, hourly_limit, superuser_always_reply, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(group_id) DO UPDATE SET "
+                "superuser_always_reply = excluded.superuser_always_reply, "
+                "updated_at = excluded.updated_at",
+                (
+                    group_id,
+                    self._default_probability,
+                    self._default_hourly_limit,
+                    int(enabled),
                     _format_timestamp(_utc_now()),
                 ),
             )
@@ -746,6 +783,16 @@ class MemoryStore:
             await db.execute(
                 "ALTER TABLE groups ADD COLUMN affection_probability REAL NOT NULL "
                 f"DEFAULT {self._default_affection_probability}"
+            )
+
+    async def _ensure_groups_superuser_reply(self, db: aiosqlite.Connection) -> None:
+        cursor = await db.execute("PRAGMA table_info(groups)")
+        rows = await cursor.fetchall()
+        await cursor.close()
+        if not any(row["name"] == "superuser_always_reply" for row in rows):
+            await db.execute(
+                "ALTER TABLE groups ADD COLUMN superuser_always_reply INTEGER NOT NULL "
+                f"DEFAULT {int(self._default_superuser_always_reply)}"
             )
 
     async def _ensure_dimensions(self, db: aiosqlite.Connection) -> None:

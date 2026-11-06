@@ -9,6 +9,7 @@ __plugin_meta__ = PluginMetadata(
     usage=(
         "在群聊中 @机器人 或回复机器人的消息即可对话。\n"
         "SUPERUSER：/回复概率 [0~100] 查询或设置当前群随机回复概率；"
+        "/超管必回 [开/关] 查询或设置 SUPERUSER 发言是否必定触发回复；"
         "/清空群记忆 清除当前群聊天记录与长期记忆。"
     ),
     type="application",
