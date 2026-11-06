@@ -11,7 +11,8 @@ from .config import Config
 from .context import build_chat_messages
 from .models import ChatContext
 
-CHAT_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0)
+CHAT_RETRY_DELAYS: tuple[float, ...] = (2.0, 5.0, 8.0)
+CHAT_RETRY_AFTER_CAP = 5.0
 CLIENT_USER_AGENT = "nonebot-plugin-group-chat-memory/0.1.2"
 
 
@@ -32,10 +33,12 @@ class ChatAPIError(ModelAPIError):
         *,
         retryable: bool = False,
         status_code: int | None = None,
+        retry_after: float | None = None,
     ) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.status_code = status_code
+        self.retry_after = retry_after
 
 
 def _make_client(timeout: float) -> httpx.AsyncClient:
@@ -145,7 +148,10 @@ class ChatClient:
             except ChatAPIError as exc:
                 if not exc.retryable or attempt + 1 >= attempts:
                     raise
-                await asyncio.sleep(self._retry_delays[attempt])
+                delay = self._retry_delays[attempt]
+                if exc.retry_after is not None:
+                    delay = min(exc.retry_after, CHAT_RETRY_AFTER_CAP)
+                await asyncio.sleep(delay)
                 continue
             return self._parse(response)
         raise ChatAPIError("聊天请求重试次数已用尽。")
@@ -173,6 +179,11 @@ class ChatClient:
                 f"聊天服务返回 HTTP {response.status_code}。",
                 retryable=response.status_code == 429 or response.status_code >= 500,
                 status_code=response.status_code,
+                retry_after=(
+                    _parse_retry_after(response.headers.get("retry-after"))
+                    if response.status_code == 429
+                    else None
+                ),
             )
         return response
 
@@ -190,6 +201,19 @@ class ChatClient:
         if not isinstance(content, str) or not content.strip():
             raise ChatAPIError("聊天响应缺少回复内容。")
         return content.strip()
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """解析 429 响应的 Retry-After（秒）；HTTP 日期或非法值返回 None。"""
+    if not value:
+        return None
+    try:
+        seconds = float(value.strip())
+    except ValueError:
+        return None
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    return seconds
 
 
 def _index_of(item: Any, fallback: int) -> int:

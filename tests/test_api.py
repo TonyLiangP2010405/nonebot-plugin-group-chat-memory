@@ -435,3 +435,72 @@ class TestChatClient:
                 await ChatClient(config).complete(make_context(), "在吗")
 
         assert len(route.calls) == 0
+
+
+async def test_retry_after_header_overrides_backoff(config, monkeypatch):
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(api.asyncio, "sleep", fake_sleep)
+    with respx.mock(assert_all_called=False) as mock:
+        mock.post(CHAT_URL).mock(
+            side_effect=[
+                httpx.Response(429, headers={"Retry-After": "0"}, json={"error": "slow"}),
+                chat_response("ok"),
+            ]
+        )
+
+        answer = await ChatClient(config, retry_delays=(9.0, 9.0)).complete(
+            make_context(), "在吗"
+        )
+
+    assert answer == "ok"
+    assert sleeps == [0.0]
+
+
+async def test_retry_after_is_capped(config, monkeypatch):
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(api.asyncio, "sleep", fake_sleep)
+    with respx.mock(assert_all_called=False) as mock:
+        mock.post(CHAT_URL).mock(
+            side_effect=[
+                httpx.Response(429, headers={"Retry-After": "120"}, json={"error": "slow"}),
+                chat_response("ok"),
+            ]
+        )
+
+        answer = await ChatClient(config, retry_delays=(9.0, 9.0)).complete(
+            make_context(), "在吗"
+        )
+
+    assert answer == "ok"
+    assert sleeps == [api.CHAT_RETRY_AFTER_CAP]
+
+
+async def test_invalid_retry_after_falls_back_to_backoff(config, monkeypatch):
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(api.asyncio, "sleep", fake_sleep)
+    with respx.mock(assert_all_called=False) as mock:
+        mock.post(CHAT_URL).mock(
+            side_effect=[
+                httpx.Response(429, headers={"Retry-After": "soon"}, json={"error": "slow"}),
+                chat_response("ok"),
+            ]
+        )
+
+        answer = await ChatClient(config, retry_delays=(9.0, 9.0)).complete(
+            make_context(), "在吗"
+        )
+
+    assert answer == "ok"
+    assert sleeps == [9.0]
