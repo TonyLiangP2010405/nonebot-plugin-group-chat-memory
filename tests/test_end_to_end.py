@@ -133,7 +133,10 @@ async def receive(
             await wait_for_message_count(runtime.store, event.group_id, stored_count)
         if reply is not None and runtime is not None:
             send_group_msg.assert_awaited_once_with(
-                group_id=event.group_id, message=MessageSegment.text(reply)
+                group_id=event.group_id,
+                message=Message(
+                    [MessageSegment.reply(event.message_id), MessageSegment.text(reply)]
+                ),
             )
 
 

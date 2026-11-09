@@ -29,6 +29,7 @@ class TestConfigDefaults:
         assert config.group_chat_memory_chunk_size == 10
         assert config.group_chat_memory_long_term_memories == 5
         assert config.group_chat_memory_default_probability == 0.0
+        assert config.group_chat_memory_default_quote_probability == 100.0
         assert config.group_chat_memory_hourly_request_limit == 10
         assert config.group_chat_memory_ignored_qq == set()
         assert config.group_chat_memory_db_path_override is None
@@ -118,6 +119,19 @@ class TestProbability:
     def test_rejects_values_outside_range(self, value):
         with pytest.raises(ValidationError):
             Config(group_chat_memory_default_probability=value)
+
+
+class TestQuoteProbability:
+    @pytest.mark.parametrize("value", [0, 0.0, 5.5, 100, 100.0])
+    def test_accepts_values_in_range(self, value):
+        config = Config(group_chat_memory_default_quote_probability=value)
+
+        assert config.group_chat_memory_default_quote_probability == value
+
+    @pytest.mark.parametrize("value", [-0.1, 100.1, 101])
+    def test_rejects_values_outside_range(self, value):
+        with pytest.raises(ValidationError):
+            Config(group_chat_memory_default_quote_probability=value)
 
 
 class TestAffectionBoost:

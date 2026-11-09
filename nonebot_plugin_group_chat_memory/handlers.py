@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 GENERIC_REPLY_ERROR = "暂时无法生成回复，请稍后再试。"
 PERMISSION_DENIED = "仅 SUPERUSER 可执行此命令。"
 INVALID_PROBABILITY = "概率需为 0～100 的数字，最多一位小数。"
+INVALID_QUOTE_PROBABILITY = "引用概率需为 0～100 的数字，最多一位小数。"
 INVALID_HOURLY_LIMIT = "每小时请求上限必须是 1 到 10000 的整数。"
 INVALID_AFFECTION_PROBABILITY = "好感榜触发概率需为 0～100 的数字，最多一位小数。"
 INVALID_AFFECTION_SWITCH = "开关参数只能是“开”或“关”。"
@@ -115,8 +116,18 @@ async def shutdown() -> None:
             await store.close()
 
 
+async def _outgoing_text(
+    group_id: int, text: str, message_id: int | None
+) -> Message | MessageSegment:
+    """按当前群引用概率构造回复：命中且知道触发消息时附带引用。"""
+    if message_id is not None and await coordinator.should_quote(group_id):
+        return Message([MessageSegment.reply(message_id), MessageSegment.text(text)])
+    return MessageSegment.text(text)
+
+
 async def reply(group_id: int, message: MemoryMessage) -> None:
     bot = _bots[group_id]
+    message_id = message.message_id
     try:
         context = await context_builder.build(group_id, message.text)
         response = await chat_client.complete(
@@ -125,10 +136,14 @@ async def reply(group_id: int, message: MemoryMessage) -> None:
     except Exception as exc:
         status = f" HTTP {exc.status_code}" if isinstance(exc, ChatAPIError) else ""
         logger.error("群 %s 的聊天回复失败：%s%s", group_id, type(exc).__name__, status)
-        await bot.send_group_msg(group_id=group_id, message=GENERIC_REPLY_ERROR)
+        await bot.send_group_msg(
+            group_id=group_id,
+            message=await _outgoing_text(group_id, GENERIC_REPLY_ERROR, message_id),
+        )
         return
 
-    await bot.send_group_msg(group_id=group_id, message=MessageSegment.text(response))
+    outgoing = await _outgoing_text(group_id, response, message_id)
+    await bot.send_group_msg(group_id=group_id, message=outgoing)
     if message.attach_meme:
         try:
             image_url = await meme_provider.fetch(response)
@@ -378,6 +393,9 @@ async def handle_model_config(bot: Bot, event: MessageEvent) -> None:
 probability_matcher = on_command(
     "回复概率", rule=_eligible_group_message, priority=-1001, block=True
 )
+quote_probability_matcher = on_command(
+    "引用概率", rule=_eligible_group_message, priority=-1001, block=True
+)
 clear_matcher = on_command(
     "清空群记忆", rule=_eligible_group_message, priority=-1001, block=True
 )
@@ -424,6 +442,27 @@ async def handle_probability(
     probability = float(text)
     await store.set_probability(event.group_id, probability)
     await probability_matcher.finish(f"已设置当前群随机回复概率：{probability:.1f}%")
+
+
+@quote_probability_matcher.handle()
+async def handle_quote_probability(
+    bot: Bot,
+    event: GroupMessageEvent,
+    args: Annotated[Message, CommandArg()],
+) -> None:
+    if not await SUPERUSER(bot, event):
+        await quote_probability_matcher.finish(PERMISSION_DENIED)
+
+    text = args.extract_plain_text().strip()
+    if not text:
+        probability = await store.get_quote_probability(event.group_id)
+        await quote_probability_matcher.finish(f"当前群引用回复概率：{probability:.1f}%")
+    if PROBABILITY_PATTERN.fullmatch(text) is None:
+        await quote_probability_matcher.finish(INVALID_QUOTE_PROBABILITY)
+
+    probability = float(text)
+    await store.set_quote_probability(event.group_id, probability)
+    await quote_probability_matcher.finish(f"已设置当前群引用回复概率：{probability:.1f}%")
 
 
 @clear_matcher.handle()
@@ -713,6 +752,7 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         display_name=event.sender.card or event.sender.nickname or str(event.user_id),
         text=text,
         created_at=datetime.fromtimestamp(event.time, timezone.utc),
+        message_id=event.message_id,
     )
     _bots[event.group_id] = bot
     await writer.record(memory_message)
@@ -720,7 +760,12 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         if await store.consume_request_slot(event.group_id):
             coordinator.submit(event.group_id, memory_message, explicit=True)
         else:
-            await bot.send_group_msg(group_id=event.group_id, message=RATE_LIMIT_NOTICE)
+            await bot.send_group_msg(
+                group_id=event.group_id,
+                message=await _outgoing_text(
+                    event.group_id, RATE_LIMIT_NOTICE, event.message_id
+                ),
+            )
         raise StopPropagation
     if event.reply is not None:
         return

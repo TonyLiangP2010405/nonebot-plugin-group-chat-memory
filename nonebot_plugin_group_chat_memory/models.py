@@ -20,6 +20,8 @@ class Message(BaseModel):
     created_at: datetime = Field(default_factory=_utc_now)
     is_bot: bool = False
     attach_meme: bool = False
+    # OneBot message ID for quoted replies; not persisted.
+    message_id: int | None = None
 
 
 class ChunkStatus(str, Enum):

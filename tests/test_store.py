@@ -18,12 +18,14 @@ def make_config(
     *,
     dimensions: int = DIMENSIONS,
     default_probability: float = 0.0,
+    default_quote_probability: float = 100.0,
     filename: str = "memory.db",
 ) -> Config:
     return Config(
         group_chat_memory_db_path_override=str(tmp_path / filename),
         group_chat_memory_embedding_dimensions=dimensions,
         group_chat_memory_default_probability=default_probability,
+        group_chat_memory_default_quote_probability=default_quote_probability,
     )
 
 
@@ -212,6 +214,83 @@ class TestProbability:
             assert await second.get_probability(100) == pytest.approx(42.5)
         finally:
             await second.close()
+
+
+class TestQuoteProbability:
+    async def test_new_group_defaults_to_configured_value(self, store):
+        assert await store.get_quote_probability(100) == pytest.approx(100.0)
+
+    async def test_new_group_uses_configured_default(self, tmp_path):
+        store = await open_store(
+            make_config(tmp_path, default_quote_probability=42.5)
+        )
+        try:
+            assert await store.get_quote_probability(100) == pytest.approx(42.5)
+            assert await store.get_probability(100) == 0.0
+        finally:
+            await store.close()
+
+    async def test_set_and_get_quote_probability(self, store):
+        await store.set_quote_probability(100, 5.5)
+
+        assert await store.get_quote_probability(100) == pytest.approx(5.5)
+        assert await store.get_quote_probability(200) == pytest.approx(100.0)
+
+    @pytest.mark.parametrize("value", [0, 0.0, 100, 100.0, 0.1])
+    async def test_quote_probability_boundaries_are_accepted(self, store, value):
+        await store.set_quote_probability(100, value)
+
+        assert await store.get_quote_probability(100) == pytest.approx(value)
+
+    @pytest.mark.parametrize("value", [-0.1, 100.1, -1, 101])
+    async def test_quote_probability_out_of_range_is_rejected(self, store, value):
+        await store.set_quote_probability(100, 10.0)
+
+        with pytest.raises(ValueError, match="0 到 100"):
+            await store.set_quote_probability(100, value)
+
+        assert await store.get_quote_probability(100) == pytest.approx(10.0)
+
+    async def test_quote_probability_survives_restart(self, tmp_path):
+        config = make_config(tmp_path)
+        first = await open_store(config)
+        try:
+            await first.set_quote_probability(100, 42.5)
+        finally:
+            await first.close()
+
+        second = await open_store(config)
+        try:
+            assert await second.get_quote_probability(100) == pytest.approx(42.5)
+        finally:
+            await second.close()
+
+    async def test_legacy_database_gains_quote_probability_column(self, tmp_path):
+        path = tmp_path / "legacy-quote.db"
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute(
+                "CREATE TABLE groups ("
+                "group_id INTEGER PRIMARY KEY, "
+                "probability REAL NOT NULL DEFAULT 0, "
+                "updated_at TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO groups(group_id, probability, updated_at) "
+                "VALUES (100, 12.5, 'now')"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        store = await open_store(make_config(tmp_path, filename="legacy-quote.db"))
+        try:
+            assert await store.get_quote_probability(100) == pytest.approx(100.0)
+            await store.set_quote_probability(100, 33.3)
+            assert await store.get_quote_probability(100) == pytest.approx(33.3)
+            assert await store.get_probability(100) == pytest.approx(12.5)
+        finally:
+            await store.close()
 
 
 class TestSuperuserReply:
@@ -555,6 +634,7 @@ class TestSearch:
 class TestClearGroup:
     async def test_clear_removes_messages_chunks_and_vectors_but_keeps_probability(self, store):
         await store.set_probability(100, 42.5)
+        await store.set_quote_probability(100, 55.5)
         await seed_chunk(store, 100, ["m0", "m1"], [1.0, 0.0, 0.0, 0.0])
         await store.add_message(make_message(100, "m2", index=2))
 
@@ -564,6 +644,7 @@ class TestClearGroup:
         assert await store.pending_chunks() == []
         assert await store.search(100, [1.0, 0.0, 0.0, 0.0], 5) == []
         assert await store.get_probability(100) == pytest.approx(42.5)
+        assert await store.get_quote_probability(100) == pytest.approx(55.5)
 
         await store.add_message(make_message(100, "fresh-0", index=0))
         assert await store.create_ready_chunk(100, 2) is None

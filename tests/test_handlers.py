@@ -44,6 +44,7 @@ def make_group_event(
     to_me: bool = False,
     reply: Reply | None = None,
     anonymous: Anonymous | None = None,
+    message_id: int = 1,
 ) -> GroupMessageEvent:
     message = content if isinstance(content, Message) else Message(content)
     return GroupMessageEvent(
@@ -52,7 +53,7 @@ def make_group_event(
         post_type="message",
         message_type="group",
         sub_type="anonymous" if anonymous else "normal",
-        message_id=1,
+        message_id=message_id,
         user_id=user_id,
         group_id=group_id,
         message=message,
@@ -112,6 +113,8 @@ async def runtime(monkeypatch):
     complete = AsyncMock(return_value="模型回复")
     get_probability = AsyncMock(return_value=0.0)
     set_probability = AsyncMock()
+    get_quote_probability = AsyncMock(return_value=0.0)
+    set_quote_probability = AsyncMock()
     clear_group = AsyncMock()
     get_hourly_limit = AsyncMock(return_value=10)
     set_hourly_limit = AsyncMock()
@@ -136,6 +139,8 @@ async def runtime(monkeypatch):
     monkeypatch.setattr(handlers.chat_client, "complete", complete)
     monkeypatch.setattr(handlers.store, "get_probability", get_probability)
     monkeypatch.setattr(handlers.store, "set_probability", set_probability)
+    monkeypatch.setattr(handlers.store, "get_quote_probability", get_quote_probability)
+    monkeypatch.setattr(handlers.store, "set_quote_probability", set_quote_probability)
     monkeypatch.setattr(handlers.store, "clear_group", clear_group)
     monkeypatch.setattr(handlers.store, "get_hourly_limit", get_hourly_limit)
     monkeypatch.setattr(handlers.store, "set_hourly_limit", set_hourly_limit)
@@ -182,6 +187,8 @@ async def runtime(monkeypatch):
             complete=complete,
             get_probability=get_probability,
             set_probability=set_probability,
+            get_quote_probability=get_quote_probability,
+            set_quote_probability=set_quote_probability,
             clear_group=clear_group,
             get_hourly_limit=get_hourly_limit,
             set_hourly_limit=set_hourly_limit,
@@ -427,7 +434,10 @@ async def test_model_and_config_errors_send_generic_message(
             bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
             ctx.should_call_api(
                 "send_group_msg",
-                {"group_id": GROUP_ID, "message": "暂时无法生成回复，请稍后再试。"},
+                {
+                    "group_id": GROUP_ID,
+                    "message": MessageSegment.text("暂时无法生成回复，请稍后再试。"),
+                },
                 {"message_id": 123},
             )
             ctx.receive_event(bot, event)
@@ -498,11 +508,131 @@ async def test_probability_setting_rejects_invalid_input(app: App, runtime, valu
     runtime.complete.assert_not_awaited()
 
 
+async def test_quote_probability_query_is_superuser_only_and_uses_one_decimal(
+    app: App, runtime
+):
+    runtime.get_quote_probability.return_value = 12.26
+    event = make_group_event("/引用概率", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, "当前群引用回复概率：12.3%", result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.quote_probability_matcher)
+
+    runtime.get_quote_probability.assert_awaited_once_with(GROUP_ID)
+    runtime.record.assert_not_awaited()
+    runtime.complete.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"), [("0", 0.0), ("0.0", 0.0), ("5.5", 5.5), ("100", 100.0)]
+)
+async def test_quote_probability_setting_accepts_one_decimal(
+    app: App, runtime, value, expected
+):
+    event = make_group_event(f"/引用概率 {value}", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, f"已设置当前群引用回复概率：{expected:.1f}%", result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.quote_probability_matcher)
+
+    runtime.set_quote_probability.assert_awaited_once_with(GROUP_ID, expected)
+    runtime.get_quote_probability.assert_not_awaited()
+    runtime.record.assert_not_awaited()
+    runtime.complete.assert_not_awaited()
+
+
+@pytest.mark.parametrize("value", ["-1", "100.1", "1.23", ".5", "5.", "abc", "nan"])
+async def test_quote_probability_setting_rejects_invalid_input(app: App, runtime, value):
+    event = make_group_event(f"/引用概率 {value}", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event,
+            "引用概率需为 0～100 的数字，最多一位小数。",
+            result=None,
+            bot=bot,
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.quote_probability_matcher)
+
+    runtime.set_quote_probability.assert_not_awaited()
+    runtime.record.assert_not_awaited()
+    runtime.complete.assert_not_awaited()
+
+
+async def test_reply_quotes_trigger_message_when_quote_probability_is_100(
+    app: App, runtime
+):
+    runtime.get_quote_probability.return_value = 100.0
+    event = make_group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text("你好")]),
+        to_me=True,
+        message_id=321,
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        send_group_msg = AsyncMock(return_value={"message_id": 123})
+        bot.send_group_msg = send_group_msg
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_until(lambda: runtime.record.await_count == 2)
+
+    send_group_msg.assert_awaited_once_with(
+        group_id=GROUP_ID,
+        message=Message(
+            [MessageSegment.reply(321), MessageSegment.text("模型回复")]
+        ),
+    )
+    runtime.get_quote_probability.assert_awaited_once_with(GROUP_ID)
+    assert runtime.record.await_args_list[-1].args[0].text == "模型回复"
+
+
+async def test_generic_error_is_quoted_when_quote_probability_is_100(
+    app: App, runtime
+):
+    runtime.get_quote_probability.return_value = 100.0
+    runtime.complete.side_effect = ConfigError("缺少密钥")
+    event = make_group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text("你好")]),
+        to_me=True,
+        message_id=77,
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        send_group_msg = AsyncMock(return_value={"message_id": 123})
+        bot.send_group_msg = send_group_msg
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_until(lambda: send_group_msg.await_count == 1)
+
+    send_group_msg.assert_awaited_once_with(
+        group_id=GROUP_ID,
+        message=Message(
+            [
+                MessageSegment.reply(77),
+                MessageSegment.text("暂时无法生成回复，请稍后再试。"),
+            ]
+        ),
+    )
+    assert runtime.record.await_count == 1
+
+
 @pytest.mark.parametrize(
     "command",
     [
         "/回复概率",
         "/回复概率 50",
+        "/引用概率",
+        "/引用概率 50",
         "/清空群记忆",
         "/每小时次数 20",
         "/好感概率 30",
@@ -522,6 +652,8 @@ async def test_non_superuser_gets_short_denial_without_side_effects(
 
     runtime.get_probability.assert_not_awaited()
     runtime.set_probability.assert_not_awaited()
+    runtime.get_quote_probability.assert_not_awaited()
+    runtime.set_quote_probability.assert_not_awaited()
     runtime.clear_group.assert_not_awaited()
     runtime.record.assert_not_awaited()
     runtime.complete.assert_not_awaited()
@@ -992,7 +1124,7 @@ async def test_explicit_rate_limit_sends_notice_without_model(app: App, runtime)
             "send_group_msg",
             {
                 "group_id": GROUP_ID,
-                "message": "本群本小时请求次数已用完，请稍后再来。",
+                "message": MessageSegment.text("本群本小时请求次数已用完，请稍后再来。"),
             },
             {"message_id": 123},
         )
@@ -1389,15 +1521,18 @@ async def test_affection_command_changes_real_store_and_reply(app: App, monkeypa
 
         async with app.test_matcher() as ctx:
             bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
-            ctx.should_call_api(
-                "send_group_msg",
-                {"group_id": GROUP_ID, "message": MessageSegment.text("模型回复")},
-                {"message_id": 123},
-            )
+            send_group_msg = AsyncMock(return_value={"message_id": 123})
+            bot.send_group_msg = send_group_msg
             ctx.receive_event(bot, make_group_event("好感榜成员说话"))
             await ctx.run()
             await wait_until(lambda: handlers.writer.record.await_count == 2)
 
+        send_group_msg.assert_awaited_once_with(
+            group_id=GROUP_ID,
+            message=Message(
+                [MessageSegment.reply(1), MessageSegment.text("模型回复")]
+            ),
+        )
         assert await store.get_affection_enabled(GROUP_ID) is True
         handlers.chat_client.complete.assert_awaited_once()
     finally:
@@ -1462,7 +1597,7 @@ async def test_directed_message_still_subject_to_hourly_limit(app: App, runtime,
             "send_group_msg",
             {
                 "group_id": GROUP_ID,
-                "message": "本群本小时请求次数已用完，请稍后再来。",
+                "message": MessageSegment.text("本群本小时请求次数已用完，请稍后再来。"),
             },
             {"message_id": 123},
         )
@@ -1732,15 +1867,18 @@ async def test_always_reply_command_changes_real_store_and_reply(
 
         async with app.test_matcher() as ctx:
             bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
-            ctx.should_call_api(
-                "send_group_msg",
-                {"group_id": GROUP_ID, "message": MessageSegment.text("模型回复")},
-                {"message_id": 123},
-            )
+            send_group_msg = AsyncMock(return_value={"message_id": 123})
+            bot.send_group_msg = send_group_msg
             ctx.receive_event(bot, make_group_event("名单里的人说话"))
             await ctx.run()
             await wait_until(lambda: handlers.writer.record.await_count == 2)
 
+        send_group_msg.assert_awaited_once_with(
+            group_id=GROUP_ID,
+            message=Message(
+                [MessageSegment.reply(1), MessageSegment.text("模型回复")]
+            ),
+        )
         handlers.chat_client.complete.assert_awaited_once()
     finally:
         await coordinator.close()

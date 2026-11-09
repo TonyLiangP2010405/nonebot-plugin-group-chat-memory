@@ -55,6 +55,8 @@ _SCHEMA_STATEMENTS = (
             CHECK (affection_probability >= 0 AND affection_probability <= 100),
         superuser_always_reply INTEGER NOT NULL DEFAULT 1
             CHECK (superuser_always_reply IN (0, 1)),
+        quote_probability REAL
+            CHECK (quote_probability >= 0 AND quote_probability <= 100),
         updated_at TEXT NOT NULL
     )
     """,
@@ -138,6 +140,7 @@ class MemoryStore:
         self._config = config
         self._dimensions = config.group_chat_memory_embedding_dimensions
         self._default_probability = config.group_chat_memory_default_probability
+        self._default_quote_probability = config.group_chat_memory_default_quote_probability
         self._default_hourly_limit = config.group_chat_memory_hourly_request_limit
         self._default_affection_enabled = DEFAULT_AFFECTION_ENABLED
         self._default_affection_probability = DEFAULT_AFFECTION_PROBABILITY
@@ -188,6 +191,7 @@ class MemoryStore:
                     await self._ensure_groups_hourly_limit(tx)
                     await self._ensure_groups_affection_settings(tx)
                     await self._ensure_groups_superuser_reply(tx)
+                    await self._ensure_groups_quote_probability(tx)
                     await self._ensure_dimensions(tx)
                     if use_sqlite_vec:
                         await tx.execute(
@@ -282,6 +286,39 @@ class MemoryStore:
                 "ON CONFLICT(group_id) DO UPDATE SET "
                 "probability = excluded.probability, updated_at = excluded.updated_at",
                 (group_id, probability, _format_timestamp(_utc_now())),
+            )
+
+    async def get_quote_probability(self, group_id: int) -> float:
+        """返回当前群引用回复的概率；未单独设置时使用插件默认值。"""
+        async with self._lock:
+            db = self._require_db()
+            cursor = await db.execute(
+                "SELECT quote_probability FROM groups WHERE group_id = ?", (group_id,)
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        if row is None or row["quote_probability"] is None:
+            return self._default_quote_probability
+        return float(row["quote_probability"])
+
+    async def set_quote_probability(self, group_id: int, value: float) -> None:
+        """设置当前群引用回复的概率，取值必须在 0 到 100 之间。"""
+        probability = float(value)
+        if not math.isfinite(probability) or not 0.0 <= probability <= 100.0:
+            raise ValueError("引用回复概率必须是 0 到 100 之间的数值。")
+        async with self._transaction() as db:
+            await db.execute(
+                "INSERT INTO groups"
+                "(group_id, probability, quote_probability, updated_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(group_id) DO UPDATE SET "
+                "quote_probability = excluded.quote_probability, "
+                "updated_at = excluded.updated_at",
+                (
+                    group_id,
+                    self._default_probability,
+                    probability,
+                    _format_timestamp(_utc_now()),
+                ),
             )
 
     async def get_hourly_limit(self, group_id: int) -> int:
@@ -712,7 +749,7 @@ class MemoryStore:
         return [_row_to_chunk(row) for _, _, row in scored[:limit]]
 
     async def clear_group(self, group_id: int) -> None:
-        """删除当前群的消息、片段、向量和请求计数，保留概率与每小时上限。"""
+        """删除当前群的消息、片段、向量和请求计数，保留概率、引用概率与每小时上限。"""
         async with self._transaction() as db:
             await db.execute(
                 "DELETE FROM memory_vector_blobs WHERE group_id = ?", (group_id,)
@@ -793,6 +830,16 @@ class MemoryStore:
             await db.execute(
                 "ALTER TABLE groups ADD COLUMN superuser_always_reply INTEGER NOT NULL "
                 f"DEFAULT {int(self._default_superuser_always_reply)}"
+            )
+
+    async def _ensure_groups_quote_probability(self, db: aiosqlite.Connection) -> None:
+        cursor = await db.execute("PRAGMA table_info(groups)")
+        rows = await cursor.fetchall()
+        await cursor.close()
+        if not any(row["name"] == "quote_probability" for row in rows):
+            await db.execute(
+                "ALTER TABLE groups ADD COLUMN quote_probability REAL "
+                "CHECK (quote_probability >= 0 AND quote_probability <= 100)"
             )
 
     async def _ensure_dimensions(self, db: aiosqlite.Connection) -> None:
