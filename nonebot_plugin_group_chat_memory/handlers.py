@@ -90,8 +90,9 @@ VOICE_PROVIDER_ALIASES = {
 QWEN_REFERENCE_SUFFIXES = {".wav", ".mp3", ".ogg", ".opus"}
 MANTOU_VOICE_FILENAME = "mantou_voice.wav"
 MANTOU_VOICE_DESCRIPTION = (
-    "一位偏萝莉的年轻少女音，音色清亮、软萌、活泼，语速稍快，"
-    "像群聊里随口聊天，不要播音腔，不要气声，不要背景音乐和音效。"
+    "一位元气、奶声奶气的高音少女音，像动漫里活泼的小女孩角色，"
+    "音色清亮、软萌、略带俏皮，语速稍快，情绪开朗，"
+    "不要播音腔，不要气声，不要背景音乐和音效。"
 )
 MANTOU_VOICE_SAMPLE = (
     "确实，今天这局打得有点抽象。刚才那波我明明想撤，结果手一抖又冲上去了。"
@@ -698,7 +699,7 @@ async def handle_mantou_voice(bot: Bot, event: MessageEvent) -> None:
 
     await mantou_voice_matcher.finish(
         "馒头固定音色已生成并保存，已切换为 Qwen 语音。"
-        "之后 /语音 和自动语音都会使用这个偏萝莉的少女音。"
+        "之后 /语音 和自动语音都会使用这个元气小女孩音色。"
     )
 
 

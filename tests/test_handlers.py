@@ -3176,7 +3176,7 @@ async def test_generate_mantou_voice_saves_sample_and_switches_provider(
         ctx.should_call_send(
             event,
             "馒头固定音色已生成并保存，已切换为 Qwen 语音。"
-            "之后 /语音 和自动语音都会使用这个偏萝莉的少女音。",
+            "之后 /语音 和自动语音都会使用这个元气小女孩音色。",
             result=None,
             bot=bot,
         )
