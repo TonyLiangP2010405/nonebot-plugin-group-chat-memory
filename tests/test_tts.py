@@ -203,13 +203,30 @@ async def test_qwen_accepts_inline_base64_audio():
     assert audio == b"inline-audio"
 
 
-async def test_qwen_requires_key_workspace_and_reference():
+async def test_qwen_requires_key_and_reference():
     with pytest.raises(TTSError, match="API Key"):
         await make_qwen_client(key="").synthesize("你好")
-    with pytest.raises(TTSError, match="业务空间"):
-        await make_qwen_client(workspace="").synthesize("你好")
     with pytest.raises(TTSError, match="参考音频"):
         await make_qwen_client(reference="").synthesize("你好")
+
+
+@respx.mock
+async def test_qwen_without_workspace_uses_qianwen_platform_endpoint():
+    platform_url = (
+        "https://maas.qianwenaiapi.com"
+        "/api/v1/services/audio/tts/SpeechSynthesizer"
+    )
+    post = respx.post(platform_url).mock(
+        return_value=httpx.Response(200, json={"output": {"audio": {"url": QWEN_AUDIO_URL}}})
+    )
+    respx.get(QWEN_AUDIO_URL).mock(
+        return_value=httpx.Response(200, content=b"platform-wav")
+    )
+
+    audio = await make_qwen_client(workspace="").synthesize("你好")
+
+    assert audio == b"platform-wav"
+    assert post.call_count == 1
 
 
 @respx.mock

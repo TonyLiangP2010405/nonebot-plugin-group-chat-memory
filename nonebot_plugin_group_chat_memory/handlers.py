@@ -99,7 +99,7 @@ MANTOU_VOICE_SAMPLE = (
     "行了，先吃饭，吃完再说。"
 )
 VOICE_SAMPLE_NOT_CONFIGURED = (
-    "生成馒头音色需要先配置阿里云：私聊发送 /设置阿里云密钥 和 /设置阿里云空间。"
+    "生成馒头音色需要先配置千问 API Key：私聊发送 /设置阿里云密钥。"
 )
 VOICE_SAMPLE_FAILED = "馒头音色生成失败，请稍后重试或检查阿里云配置。"
 VOICE_EXPORT_MISSING = "还没有生成馒头音色，请先私聊发送 /生成馒头音色。"
@@ -207,7 +207,6 @@ def _voice_configured() -> bool:
     if _voice_provider() == "qwen":
         return bool(
             config.group_chat_memory_qwen_api_key.get_secret_value().strip()
-            and config.group_chat_memory_qwen_workspace_id.strip()
             and config.group_chat_memory_qwen_reference.strip()
         )
     return bool(config.group_chat_memory_tts_api_key.get_secret_value().strip())
@@ -673,10 +672,7 @@ async def handle_mantou_voice(bot: Bot, event: MessageEvent) -> None:
         await mantou_voice_matcher.finish("请在私聊中生成馒头音色。")
     if not await SUPERUSER(bot, event):
         await mantou_voice_matcher.finish(PERMISSION_DENIED)
-    if not (
-        config.group_chat_memory_qwen_api_key.get_secret_value().strip()
-        and config.group_chat_memory_qwen_workspace_id.strip()
-    ):
+    if not config.group_chat_memory_qwen_api_key.get_secret_value().strip():
         await mantou_voice_matcher.finish(VOICE_SAMPLE_NOT_CONFIGURED)
 
     try:
@@ -774,7 +770,7 @@ async def handle_model_config(bot: Bot, event: MessageEvent) -> None:
         f"语音音色：{_voice_label(config.group_chat_memory_tts_voice_id)}\n"
         "阿里云密钥："
         f"{status(config.group_chat_memory_qwen_api_key.get_secret_value())}\n"
-        f"阿里云空间：{config.group_chat_memory_qwen_workspace_id or '未配置'}\n"
+        f"阿里云空间：{config.group_chat_memory_qwen_workspace_id or '未配置（走千问AI平台）'}\n"
         f"语音参考：{_reference_label(config.group_chat_memory_qwen_reference)}\n"
         f"接口 ID：{config.group_chat_memory_apihz_id or '未配置'}\n"
         f"接口密钥：{status(config.group_chat_memory_apihz_key.get_secret_value())}"

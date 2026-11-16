@@ -69,10 +69,11 @@ COMMAND_START=["/"]
 
 ```text
 /设置语音模型 qwen
-/设置阿里云密钥 sk-your-dashscope-key
-/设置阿里云空间 your-workspace-id
+/设置阿里云密钥 sk-your-qwen-key
 /设置语音参考 https://your-host/voice-30s.wav
 ```
+
+如果使用**千问AI平台**（`platform.qianwenai.com`），只填 API Key 即可，插件默认走 `https://maas.qianwenaiapi.com/api/v1/services/audio/tts/SpeechSynthesizer`，不需要业务空间。如果使用**阿里云百炼**，再补一条 `/设置阿里云空间 <WorkspaceId>`，插件会改走 `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/...`。
 
 `/设置语音参考` 也接受 Bot 所在服务器上的本地文件路径（WAV/MP3/OGG/OPUS，≤10 MB、约 30 秒内）。参考音频最多 3 条由模型支持，本插件当前只用 1 条。**请只使用本人授权的声音素材；插件不内置、不抓取任何主播或他人的音频。** Qwen 的提示词上限 3000 字符，模型按音频 token 计费。
 
@@ -81,10 +82,11 @@ COMMAND_START=["/"]
 不想用任何真人参考音频时，可以先生成一个**原创合成声音**，再固定使用：
 
 ```text
-/设置阿里云密钥 sk-your-dashscope-key
-/设置阿里云空间 your-workspace-id
+/设置阿里云密钥 sk-your-qwen-key
 /生成馒头音色
 ```
+
+（如果你用的是阿里云百炼而不是千问AI平台，再补一条 `/设置阿里云空间 <WorkspaceId>`。）
 
 该命令会按“偏萝莉的年轻少女音、清亮软萌、语速稍快、像群聊随口聊天”的描述生成一段原创参考音频，保存为插件数据目录下的 `mantou_voice.wav`，自动写入 Qwen 参考音频并切换到 Qwen 后端。之后所有语音回复都会使用这个固定音色；重新执行 `/生成馒头音色` 可以重新生成，想换别的参考音频则用 `/设置语音参考` 覆盖。想把这个音色文件导出来，私聊发送 `/导出馒头音色`，Bot 会把 `mantou_voice.wav` 作为私聊文件发给你；协议端不支持文件上传时会退化为语音消息。
 
@@ -155,7 +157,7 @@ SUPERUSER 还可以引用一条群消息发送 `/语音`，Bot 会针对被引�
 | `/设置语音密钥 <KEY>` | 仅私聊 SUPERUSER | 设置 DeepSeek TTS API Key。 |
 | `/设置语音音色 [stella/tide]` | 仅私聊 SUPERUSER | DeepSeek 专用：查询或切换音色；`stella` 女声（默认），`tide` 男声。 |
 | `/设置阿里云密钥 <KEY>` | 仅私聊 SUPERUSER | 设置阿里云百炼 DashScope API Key。 |
-| `/设置阿里云空间 <WorkspaceId>` | 仅私聊 SUPERUSER | 设置百炼业务空间 ID，用于拼接 Qwen 语音端点。 |
+| `/设置阿里云空间 <WorkspaceId>` | 仅私聊 SUPERUSER | 可选：设置百炼业务空间 ID；不设置时默认走千问AI平台端点。 |
 | `/设置语音参考 <URL或路径>` | 仅私聊 SUPERUSER | 设置 Qwen 参考音频；支持公网 URL 或服务器本地 WAV/MP3/OGG 路径。 |
 | `/设置语音参考 清除` | 仅私聊 SUPERUSER | 清除 Qwen 参考音频。 |
 | `/生成馒头音色` | 仅私聊 SUPERUSER | 按偏萝莉少女音描述生成原创参考音频，保存并切换 Qwen 后端。 |
@@ -204,7 +206,7 @@ SUPERUSER 还可以引用一条群消息发送 `/语音`，Bot 会针对被引�
 - 聊天地址、密钥或模型为空时，收到定向/随机触发后只发送通用错误提示；传入消息仍会保存，不会把密钥或内部响应发到群里。
 - Embedding 密钥缺失或后台向量化失败时，原始消息仍保留，未完成片段等待后续重试或重启恢复，但暂时不能用于长期检索。
 - 查询 Embedding 超时或失败时，回复会降级为最近消息上下文，不阻断聊天。
-- 当前语音后端未配置完整（DeepSeek 缺 Key；Qwen 缺 Key、业务空间或参考音频）、TTS 超时、限流或内容审核失败时，语音那一份自动降级为普通文字；不会因此丢消息或中断该群后续回复。
+- 当前语音后端未配置完整（DeepSeek 缺 Key；Qwen 缺 API Key 或参考音频）、TTS 超时、限流或内容审核失败时，语音那一份自动降级为普通文字；不会因此丢消息或中断该群后续回复。
 - 数据库向量维度不匹配属于配置/数据错误，应先按备份说明处理，而不是直接删除生产数据。
 
 ## 随机回复风险

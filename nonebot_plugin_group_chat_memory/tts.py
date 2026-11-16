@@ -14,6 +14,9 @@ TTS_RETRY_DELAYS: tuple[float, ...] = (1.0, 2.0)
 TTS_MAX_CHARS = 5_000
 TTS_VOICE_IDS = frozenset({"stella", "tide"})
 CLIENT_USER_AGENT = "nonebot-plugin-group-chat-memory"
+QWEN_PLATFORM_ENDPOINT = (
+    "https://maas.qianwenaiapi.com/api/v1/services/audio/tts/SpeechSynthesizer"
+)
 QWEN_MAX_PROMPT = 3_000
 QWEN_MAX_REFERENCE_BYTES = 10 * 1024 * 1024
 QWEN_REFERENCE_MIME = {
@@ -173,11 +176,11 @@ class QwenTTSClient:
     async def _request(self, payload: dict[str, Any]) -> bytes:
         api_key = self._config.group_chat_memory_qwen_api_key.get_secret_value().strip()
         if not api_key:
-            raise TTSError("阿里云语音未配置 API Key。")
-        workspace = self._config.group_chat_memory_qwen_workspace_id.strip()
-        if not workspace:
-            raise TTSError("阿里云百炼业务空间未配置。")
-        endpoint = _qwen_endpoint(workspace, self._config.group_chat_memory_qwen_region)
+            raise TTSError("千问语音未配置 API Key。")
+        endpoint = _qwen_endpoint(
+            self._config.group_chat_memory_qwen_workspace_id.strip(),
+            self._config.group_chat_memory_qwen_region,
+        )
 
         attempts = len(self._retry_delays) + 1
         for attempt in range(attempts):
@@ -258,6 +261,8 @@ class QwenTTSClient:
 
 
 def _qwen_endpoint(workspace: str, region: str) -> str:
+    if not workspace:
+        return QWEN_PLATFORM_ENDPOINT
     if not re.fullmatch(r"[A-Za-z0-9_-]+", workspace):
         raise TTSError("阿里云百炼业务空间 ID 格式不正确。")
     if not re.fullmatch(r"[a-z0-9-]+", region):

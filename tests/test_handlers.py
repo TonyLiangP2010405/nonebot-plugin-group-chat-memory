@@ -995,7 +995,7 @@ async def test_model_config_query_masks_both_secrets(app: App, runtime):
         "语音密钥：未配置\n"
         "语音音色：女声（stella）\n"
         "阿里云密钥：未配置\n"
-        "阿里云空间：未配置\n"
+        "阿里云空间：未配置（走千问AI平台）\n"
         "语音参考：未配置\n"
         "接口 ID：10023437\n"
         "接口密钥：已配置（****）"
@@ -2172,7 +2172,7 @@ async def test_pending_draft_does_not_swallow_private_commands(app: App, runtime
             "语音密钥：已配置（****）\n"
             "语音音色：女声（stella）\n"
             "阿里云密钥：未配置\n"
-            "阿里云空间：未配置\n"
+            "阿里云空间：未配置（走千问AI平台）\n"
             "语音参考：未配置\n"
             "接口 ID：10023437\n"
             "接口密钥：已配置（****）",
@@ -3161,7 +3161,7 @@ async def test_generate_mantou_voice_saves_sample_and_switches_provider(
     app: App, runtime, monkeypatch, tmp_path
 ):
     handlers.config.group_chat_memory_qwen_api_key = SecretStr("sk-qwen")
-    handlers.config.group_chat_memory_qwen_workspace_id = "ws-test"
+    handlers.config.group_chat_memory_qwen_workspace_id = ""
     monkeypatch.setattr(
         handlers.config,
         "group_chat_memory_db_path_override",
