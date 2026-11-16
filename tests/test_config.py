@@ -29,8 +29,15 @@ class TestConfigDefaults:
         assert config.group_chat_memory_chunk_size == 10
         assert config.group_chat_memory_long_term_memories == 5
         assert config.group_chat_memory_default_probability == 0.0
+        assert config.group_chat_memory_tts_provider == "deepseek"
         assert config.group_chat_memory_tts_api_key.get_secret_value() == ""
         assert config.group_chat_memory_tts_voice_id == "stella"
+        assert config.group_chat_memory_qwen_api_key.get_secret_value() == ""
+        assert config.group_chat_memory_qwen_workspace_id == ""
+        assert config.group_chat_memory_qwen_reference == ""
+        assert config.group_chat_memory_qwen_region == "cn-beijing"
+        assert config.group_chat_memory_qwen_timeout == 120.0
+        assert config.group_chat_memory_qwen_model == "qwen-audio-3.1-tts-next"
         assert config.group_chat_memory_tts_base_url == "https://api.deepseek.com/v1/tools/tts"
         assert config.group_chat_memory_tts_timeout == 30.0
         assert config.group_chat_memory_hourly_request_limit == 10
@@ -151,6 +158,40 @@ class TestTTSConfig:
         assert isinstance(config.group_chat_memory_tts_api_key, SecretStr)
         assert config.group_chat_memory_tts_api_key.get_secret_value() == "sk-tts-secret"
         assert "sk-tts-secret" not in repr(config)
+
+    def test_qwen_settings_are_loaded_and_secret_is_hidden(self):
+        config = Config(
+            group_chat_memory_tts_provider="qwen",
+            group_chat_memory_qwen_api_key="sk-qwen-secret",
+            group_chat_memory_qwen_workspace_id="ws-test",
+            group_chat_memory_qwen_reference="https://example.com/ref.wav",
+            group_chat_memory_qwen_region="ap-southeast-1",
+            group_chat_memory_qwen_model="qwen-audio-3.1-tts-next",
+        )
+
+        assert config.group_chat_memory_tts_provider == "qwen"
+        assert config.group_chat_memory_qwen_workspace_id == "ws-test"
+        assert config.group_chat_memory_qwen_reference == "https://example.com/ref.wav"
+        assert config.group_chat_memory_qwen_region == "ap-southeast-1"
+        assert isinstance(config.group_chat_memory_qwen_api_key, SecretStr)
+        assert "sk-qwen-secret" not in repr(config)
+
+    def test_runtime_config_applies_qwen_fields(self):
+        config = Config()
+
+        config.apply_runtime_config(
+            {
+                "tts_provider": "qwen",
+                "qwen_api_key": "sk-runtime",
+                "qwen_workspace_id": "ws-runtime",
+                "qwen_reference": "https://example.com/runtime.wav",
+            }
+        )
+
+        assert config.group_chat_memory_tts_provider == "qwen"
+        assert config.group_chat_memory_qwen_api_key.get_secret_value() == "sk-runtime"
+        assert config.group_chat_memory_qwen_workspace_id == "ws-runtime"
+        assert config.group_chat_memory_qwen_reference == "https://example.com/runtime.wav"
 
 
 class TestAffectionBoost:

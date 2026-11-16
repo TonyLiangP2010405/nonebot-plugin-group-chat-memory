@@ -35,7 +35,14 @@ DEFAULT_AFFECTION_PROBABILITY = 30.0
 DEFAULT_SUPERUSER_ALWAYS_REPLY = True
 DEFAULT_TTS_VOICE_ID = "stella"
 DEFAULT_TTS_BASE_URL = "https://api.deepseek.com/v1/tools/tts"
+DEFAULT_TTS_PROVIDER = "deepseek"
+DEFAULT_QWEN_MODEL = "qwen-audio-3.1-tts-next"
+DEFAULT_QWEN_REGION = "cn-beijing"
 TTS_VOICES = {"stella": "女声（stella）", "tide": "男声（tide）"}
+TTS_PROVIDERS = {
+    "deepseek": "DeepSeek TTS",
+    "qwen": "阿里云 Qwen TTS Next",
+}
 
 DEFAULT_APIHZ_ID = "10023437"
 DEFAULT_APIHZ_KEY = "sk1287663323"
@@ -45,8 +52,12 @@ RUNTIME_CONFIG_DEFAULTS = {
     "chat_api_key": "",
     "chat_model": "deepseek-v4.1-flash",
     "embedding_api_key": "",
+    "tts_provider": DEFAULT_TTS_PROVIDER,
     "tts_api_key": "",
     "tts_voice_id": DEFAULT_TTS_VOICE_ID,
+    "qwen_api_key": "",
+    "qwen_workspace_id": "",
+    "qwen_reference": "",
     "apihz_id": DEFAULT_APIHZ_ID,
     "apihz_key": DEFAULT_APIHZ_KEY,
 }
@@ -72,10 +83,17 @@ class Config(BaseModel):
     group_chat_memory_chat_model: str = "deepseek-v4.1-flash"
     group_chat_memory_chat_timeout: float = Field(default=60.0, gt=0)
 
+    group_chat_memory_tts_provider: str = DEFAULT_TTS_PROVIDER
     group_chat_memory_tts_base_url: str = DEFAULT_TTS_BASE_URL
     group_chat_memory_tts_api_key: SecretStr = SecretStr("")
     group_chat_memory_tts_voice_id: str = DEFAULT_TTS_VOICE_ID
     group_chat_memory_tts_timeout: float = Field(default=30.0, gt=0)
+    group_chat_memory_qwen_api_key: SecretStr = SecretStr("")
+    group_chat_memory_qwen_workspace_id: str = ""
+    group_chat_memory_qwen_region: str = DEFAULT_QWEN_REGION
+    group_chat_memory_qwen_timeout: float = Field(default=120.0, gt=0)
+    group_chat_memory_qwen_reference: str = ""
+    group_chat_memory_qwen_model: str = DEFAULT_QWEN_MODEL
 
     group_chat_memory_embedding_base_url: str = "https://api.siliconflow.cn/v1"
     group_chat_memory_embedding_api_key: SecretStr = SecretStr("")
@@ -119,10 +137,20 @@ class Config(BaseModel):
                 self.group_chat_memory_chat_model = value
             elif key == "embedding_api_key":
                 self.group_chat_memory_embedding_api_key = SecretStr(value)
+            elif key == "tts_provider":
+                self.group_chat_memory_tts_provider = (
+                    value if value in TTS_PROVIDERS else DEFAULT_TTS_PROVIDER
+                )
             elif key == "tts_api_key":
                 self.group_chat_memory_tts_api_key = SecretStr(value)
             elif key == "tts_voice_id":
                 self.group_chat_memory_tts_voice_id = value or DEFAULT_TTS_VOICE_ID
+            elif key == "qwen_api_key":
+                self.group_chat_memory_qwen_api_key = SecretStr(value)
+            elif key == "qwen_workspace_id":
+                self.group_chat_memory_qwen_workspace_id = value
+            elif key == "qwen_reference":
+                self.group_chat_memory_qwen_reference = value
             elif key == "apihz_id":
                 self.group_chat_memory_apihz_id = value
             elif key == "apihz_key":

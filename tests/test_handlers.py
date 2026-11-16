@@ -150,6 +150,8 @@ async def runtime(monkeypatch):
     list_voice_member = AsyncMock(return_value=[])
     list_groups = AsyncMock(return_value=[])
     synthesize = AsyncMock(return_value=b"audio-bytes")
+    qwen_synthesize = AsyncMock(return_value=b"qwen-audio")
+    qwen_sample = AsyncMock(return_value=b"mantou-audio")
     consume_request_slot = AsyncMock(return_value=True)
     meme = AsyncMock()
     meme.fetch.return_value = "https://img/reply.png"
@@ -191,6 +193,8 @@ async def runtime(monkeypatch):
     monkeypatch.setattr(handlers.store, "list_voice_member", list_voice_member)
     monkeypatch.setattr(handlers.store, "list_groups", list_groups)
     monkeypatch.setattr(handlers.tts_client, "synthesize", synthesize)
+    monkeypatch.setattr(handlers.qwen_tts_client, "synthesize", qwen_synthesize)
+    monkeypatch.setattr(handlers.qwen_tts_client, "generate_sample", qwen_sample)
     coordinator = ReplyCoordinator(
         handlers.store, handlers.reply, random_value=lambda: 0.0
     )
@@ -202,14 +206,24 @@ async def runtime(monkeypatch):
             "group_chat_memory_chat_api_key",
             "group_chat_memory_chat_model",
             "group_chat_memory_embedding_api_key",
+            "group_chat_memory_tts_provider",
             "group_chat_memory_tts_api_key",
             "group_chat_memory_tts_voice_id",
+            "group_chat_memory_qwen_api_key",
+            "group_chat_memory_qwen_workspace_id",
+            "group_chat_memory_qwen_reference",
+            "group_chat_memory_qwen_region",
+            "group_chat_memory_qwen_model",
             "group_chat_memory_apihz_id",
             "group_chat_memory_apihz_key",
         )
     }
+    handlers.config.group_chat_memory_tts_provider = "deepseek"
     handlers.config.group_chat_memory_tts_api_key = SecretStr("sk-tts")
     handlers.config.group_chat_memory_tts_voice_id = "stella"
+    handlers.config.group_chat_memory_qwen_api_key = SecretStr("")
+    handlers.config.group_chat_memory_qwen_workspace_id = ""
+    handlers.config.group_chat_memory_qwen_reference = ""
     handlers._bots.clear()
     handlers._private_drafts.clear()
     try:
@@ -243,6 +257,8 @@ async def runtime(monkeypatch):
             list_voice_member=list_voice_member,
             list_groups=list_groups,
             synthesize=synthesize,
+            qwen_synthesize=qwen_synthesize,
+            qwen_sample=qwen_sample,
             coordinator=coordinator,
             meme=meme,
         )
@@ -848,6 +864,12 @@ async def test_shutdown_continues_cleanup_after_close_failure(runtime, monkeypat
             "tts-secret",
             "group_chat_memory_tts_api_key",
         ),
+        (
+            "/设置阿里云密钥 qwen-secret",
+            "qwen_api_key",
+            "qwen-secret",
+            "group_chat_memory_qwen_api_key",
+        ),
     ],
 )
 async def test_private_superuser_updates_runtime_config_immediately(
@@ -910,6 +932,7 @@ async def test_private_non_superuser_cannot_update_config(app: App, runtime, mon
         "/设置聊天模型",
         "/设置向量密钥",
         "/设置语音密钥",
+        "/设置阿里云密钥",
     ],
 )
 async def test_setting_command_rejects_empty_argument(app: App, runtime, monkeypatch, command):
@@ -968,8 +991,12 @@ async def test_model_config_query_masks_both_secrets(app: App, runtime):
         "聊天模型：deepseek-v4.1-flash\n"
         "聊天密钥：已配置（****）\n"
         "Embedding 密钥：已配置（****）\n"
+        "语音模型：DeepSeek TTS\n"
         "语音密钥：未配置\n"
         "语音音色：女声（stella）\n"
+        "阿里云密钥：未配置\n"
+        "阿里云空间：未配置\n"
+        "语音参考：未配置\n"
         "接口 ID：10023437\n"
         "接口密钥：已配置（****）"
     )
@@ -1005,6 +1032,7 @@ async def test_failed_setting_write_preserves_running_config(runtime, monkeypatc
         ("/设置聊天密钥 chat-log-secret", "chat-log-secret"),
         ("/设置向量密钥 embedding-log-secret", "embedding-log-secret"),
         ("/设置语音密钥 tts-log-secret", "tts-log-secret"),
+        ("/设置阿里云密钥 qwen-log-secret", "qwen-log-secret"),
     ],
 )
 async def test_secret_commands_are_redacted_from_event_logs(
@@ -1084,6 +1112,12 @@ def test_group_commands_and_chat_have_highest_priority():
     assert handlers.embedding_key_matcher.priority == -1001
     assert handlers.voice_key_matcher.priority == -1001
     assert handlers.voice_id_matcher.priority == -1001
+    assert handlers.voice_model_matcher.priority == -1001
+    assert handlers.qwen_key_matcher.priority == -1001
+    assert handlers.qwen_workspace_matcher.priority == -1001
+    assert handlers.qwen_reference_matcher.priority == -1001
+    assert handlers.mantou_voice_matcher.priority == -1001
+    assert handlers.export_mantou_voice_matcher.priority == -1001
     assert handlers.voice_list_matcher.priority == -1001
     assert handlers.voice_matcher.priority == -1001
     assert handlers.model_config_matcher.priority == -1001
@@ -2134,8 +2168,12 @@ async def test_pending_draft_does_not_swallow_private_commands(app: App, runtime
             "聊天模型：deepseek-v4.1-flash\n"
             "聊天密钥：未配置\n"
             "Embedding 密钥：未配置\n"
+            "语音模型：DeepSeek TTS\n"
             "语音密钥：已配置（****）\n"
             "语音音色：女声（stella）\n"
+            "阿里云密钥：未配置\n"
+            "阿里云空间：未配置\n"
+            "语音参考：未配置\n"
             "接口 ID：10023437\n"
             "接口密钥：已配置（****）",
             result=None,
@@ -2843,3 +2881,440 @@ async def test_voice_send_failure_falls_back_to_text(
     assert first.type == "record"
     assert second == MessageSegment.text("模型回复")
     assert runtime.record.await_args_list[-1].args[0].text == "模型回复"
+
+
+async def test_voice_model_query_defaults_to_deepseek(app: App, runtime):
+    event = make_private_event(content="/设置语音模型", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, "当前语音模型：DeepSeek TTS", result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.voice_model_matcher)
+
+
+@pytest.mark.parametrize(
+    ("argument", "provider", "label"),
+    [
+        ("qwen", "qwen", "阿里云 Qwen TTS Next"),
+        ("阿里云", "qwen", "阿里云 Qwen TTS Next"),
+        ("deepseek", "deepseek", "DeepSeek TTS"),
+    ],
+)
+async def test_voice_model_switch_updates_provider(
+    app: App, runtime, monkeypatch, argument, provider, label
+):
+    setter = AsyncMock()
+    monkeypatch.setattr(handlers.store, "set_runtime_config", setter)
+    event = make_private_event(
+        content=f"/设置语音模型 {argument}", user_id=SUPERUSER_ID
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, f"语音模型已切换为：{label}。", result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.voice_model_matcher)
+
+    setter.assert_awaited_once_with("tts_provider", provider)
+    assert handlers.config.group_chat_memory_tts_provider == provider
+
+
+async def test_voice_model_rejects_unknown_provider(app: App, runtime, monkeypatch):
+    setter = AsyncMock()
+    monkeypatch.setattr(handlers.store, "set_runtime_config", setter)
+    event = make_private_event(content="/设置语音模型 gpt", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, handlers.INVALID_VOICE_MODEL, result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.voice_model_matcher)
+
+    setter.assert_not_awaited()
+
+
+async def test_voice_model_rejects_group_chat(app: App, runtime, monkeypatch):
+    setter = AsyncMock()
+    monkeypatch.setattr(handlers.store, "set_runtime_config", setter)
+    event = make_group_event("/设置语音模型 qwen", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, "请在私聊中设置语音模型。", result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.voice_model_matcher)
+
+    setter.assert_not_awaited()
+
+
+async def test_qwen_workspace_query_and_setting(app: App, runtime, monkeypatch):
+    setter = AsyncMock()
+    monkeypatch.setattr(handlers.store, "set_runtime_config", setter)
+
+    query = make_private_event(content="/设置阿里云空间", user_id=SUPERUSER_ID)
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            query, "当前阿里云空间：未配置", result=None, bot=bot
+        )
+        ctx.receive_event(bot, query)
+        ctx.should_finished(handlers.qwen_workspace_matcher)
+
+    update = make_private_event(
+        content="/设置阿里云空间 ws-test_123", user_id=SUPERUSER_ID
+    )
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            update, "阿里云百炼业务空间已更新。", result=None, bot=bot
+        )
+        ctx.receive_event(bot, update)
+        ctx.should_finished(handlers.qwen_workspace_matcher)
+
+    setter.assert_awaited_once_with("qwen_workspace_id", "ws-test_123")
+    assert handlers.config.group_chat_memory_qwen_workspace_id == "ws-test_123"
+
+
+async def test_qwen_workspace_rejects_invalid_id(app: App, runtime, monkeypatch):
+    setter = AsyncMock()
+    monkeypatch.setattr(handlers.store, "set_runtime_config", setter)
+    event = make_private_event(
+        content="/设置阿里云空间 bad space", user_id=SUPERUSER_ID
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, handlers.INVALID_QWEN_WORKSPACE, result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.qwen_workspace_matcher)
+
+    setter.assert_not_awaited()
+
+
+async def test_qwen_reference_set_url_and_clear(app: App, runtime, monkeypatch):
+    setter = AsyncMock()
+    monkeypatch.setattr(handlers.store, "set_runtime_config", setter)
+
+    query = make_private_event(content="/设置语音参考", user_id=SUPERUSER_ID)
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            query, "当前语音参考：未配置", result=None, bot=bot
+        )
+        ctx.receive_event(bot, query)
+        ctx.should_finished(handlers.qwen_reference_matcher)
+
+    update = make_private_event(
+        content="/设置语音参考 https://example.com/ref.wav", user_id=SUPERUSER_ID
+    )
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(update, "语音参考已更新。", result=None, bot=bot)
+        ctx.receive_event(bot, update)
+        ctx.should_finished(handlers.qwen_reference_matcher)
+
+    assert (
+        handlers.config.group_chat_memory_qwen_reference
+        == "https://example.com/ref.wav"
+    )
+
+    clear = make_private_event(content="/设置语音参考 清除", user_id=SUPERUSER_ID)
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(clear, "语音参考已清除。", result=None, bot=bot)
+        ctx.receive_event(bot, clear)
+        ctx.should_finished(handlers.qwen_reference_matcher)
+
+    assert handlers.config.group_chat_memory_qwen_reference == ""
+    assert setter.await_count == 2
+
+
+async def test_qwen_reference_accepts_local_file(
+    app: App, runtime, monkeypatch, tmp_path
+):
+    setter = AsyncMock()
+    monkeypatch.setattr(handlers.store, "set_runtime_config", setter)
+    reference = tmp_path / "xiaoxiao.wav"
+    reference.write_bytes(b"reference")
+    event = make_private_event(
+        content=f"/设置语音参考 {reference}", user_id=SUPERUSER_ID
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, "语音参考已更新。", result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.qwen_reference_matcher)
+
+    setter.assert_awaited_once_with("qwen_reference", str(reference.resolve()))
+
+
+async def test_qwen_reference_rejects_missing_file(app: App, runtime, monkeypatch):
+    setter = AsyncMock()
+    monkeypatch.setattr(handlers.store, "set_runtime_config", setter)
+    event = make_private_event(
+        content="/设置语音参考 /no/such/reference.wav", user_id=SUPERUSER_ID
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, handlers.INVALID_QWEN_REFERENCE, result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.qwen_reference_matcher)
+
+    setter.assert_not_awaited()
+
+
+async def test_qwen_provider_voice_reply_uses_qwen_client(
+    app: App, runtime, monkeypatch
+):
+    runtime.is_voice_member.return_value = True
+    handlers.config.group_chat_memory_tts_provider = "qwen"
+    handlers.config.group_chat_memory_qwen_api_key = SecretStr("sk-qwen")
+    handlers.config.group_chat_memory_qwen_workspace_id = "ws-test"
+    handlers.config.group_chat_memory_qwen_reference = "https://example.com/ref.wav"
+    use_random(monkeypatch, 0.9)
+    event = make_group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text("你好")]),
+        to_me=True,
+    )
+    encoded = base64.b64encode(b"qwen-audio").decode()
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        send_group_msg = AsyncMock(return_value={"message_id": 123})
+        bot.send_group_msg = send_group_msg
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_until(lambda: runtime.record.await_count == 2)
+
+    send_group_msg.assert_awaited_once_with(
+        group_id=GROUP_ID,
+        message=MessageSegment.record(f"base64://{encoded}"),
+    )
+    runtime.qwen_synthesize.assert_awaited_once_with("模型回复")
+    runtime.synthesize.assert_not_awaited()
+
+
+async def test_qwen_without_reference_falls_back_to_text(
+    app: App, runtime, monkeypatch
+):
+    runtime.is_voice_member.return_value = True
+    handlers.config.group_chat_memory_tts_provider = "qwen"
+    handlers.config.group_chat_memory_qwen_api_key = SecretStr("sk-qwen")
+    handlers.config.group_chat_memory_qwen_workspace_id = "ws-test"
+    handlers.config.group_chat_memory_qwen_reference = ""
+    use_random(monkeypatch, 0.9)
+    event = make_group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text("你好")]),
+        to_me=True,
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        send_group_msg = AsyncMock(return_value={"message_id": 123})
+        bot.send_group_msg = send_group_msg
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_until(lambda: runtime.record.await_count == 2)
+
+    send_group_msg.assert_awaited_once_with(
+        group_id=GROUP_ID, message=MessageSegment.text("模型回复")
+    )
+    runtime.qwen_synthesize.assert_not_awaited()
+
+
+async def test_voice_command_reports_qwen_configuration_missing(
+    app: App, runtime
+):
+    handlers.config.group_chat_memory_tts_provider = "qwen"
+    handlers.config.group_chat_memory_qwen_api_key = SecretStr("sk-qwen")
+    handlers.config.group_chat_memory_qwen_workspace_id = "ws-test"
+    handlers.config.group_chat_memory_qwen_reference = ""
+    event = make_group_event("/语音", user_id=SUPERUSER_ID, reply=quoted_reply())
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, handlers.QWEN_VOICE_NOT_CONFIGURED, result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.voice_matcher)
+
+    runtime.qwen_synthesize.assert_not_awaited()
+
+
+async def test_generate_mantou_voice_saves_sample_and_switches_provider(
+    app: App, runtime, monkeypatch, tmp_path
+):
+    handlers.config.group_chat_memory_qwen_api_key = SecretStr("sk-qwen")
+    handlers.config.group_chat_memory_qwen_workspace_id = "ws-test"
+    monkeypatch.setattr(
+        handlers.config,
+        "group_chat_memory_db_path_override",
+        str(tmp_path / "memory.db"),
+    )
+    setter = AsyncMock()
+    monkeypatch.setattr(handlers.store, "set_runtime_config", setter)
+    event = make_private_event(content="/生成馒头音色", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event,
+            "馒头固定音色已生成并保存，已切换为 Qwen 语音。"
+            "之后 /语音 和自动语音都会使用这个偏萝莉的少女音。",
+            result=None,
+            bot=bot,
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.mantou_voice_matcher)
+
+    sample = tmp_path / handlers.MANTOU_VOICE_FILENAME
+    assert sample.read_bytes() == b"mantou-audio"
+    assert [call.args for call in setter.await_args_list] == [
+        ("qwen_reference", str(sample)),
+        ("tts_provider", "qwen"),
+    ]
+    assert handlers.config.group_chat_memory_qwen_reference == str(sample)
+    assert handlers.config.group_chat_memory_tts_provider == "qwen"
+    runtime.qwen_sample.assert_awaited_once_with(
+        handlers.MANTOU_VOICE_SAMPLE,
+        description=handlers.MANTOU_VOICE_DESCRIPTION,
+    )
+
+
+async def test_generate_mantou_voice_requires_qwen_configuration(app: App, runtime):
+    handlers.config.group_chat_memory_qwen_api_key = SecretStr("")
+    handlers.config.group_chat_memory_qwen_workspace_id = ""
+    event = make_private_event(content="/生成馒头音色", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, handlers.VOICE_SAMPLE_NOT_CONFIGURED, result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.mantou_voice_matcher)
+
+    runtime.qwen_sample.assert_not_awaited()
+
+
+async def test_generate_mantou_voice_reports_failure(app: App, runtime):
+    handlers.config.group_chat_memory_qwen_api_key = SecretStr("sk-qwen")
+    handlers.config.group_chat_memory_qwen_workspace_id = "ws-test"
+    runtime.qwen_sample.side_effect = TTSError("boom")
+    event = make_private_event(content="/生成馒头音色", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, handlers.VOICE_SAMPLE_FAILED, result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.mantou_voice_matcher)
+
+
+async def test_generate_mantou_voice_rejects_group_chat(app: App, runtime):
+    event = make_group_event("/生成馒头音色", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, "请在私聊中生成馒头音色。", result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.mantou_voice_matcher)
+
+
+async def test_generate_mantou_voice_requires_superuser(app: App, runtime):
+    event = make_private_event(content="/生成馒头音色", user_id=USER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, handlers.PERMISSION_DENIED, result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.mantou_voice_matcher)
+
+    runtime.qwen_sample.assert_not_awaited()
+
+
+async def test_export_mantou_voice_uploads_file(
+    app: App, runtime, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        handlers.config,
+        "group_chat_memory_db_path_override",
+        str(tmp_path / "memory.db"),
+    )
+    sample = tmp_path / handlers.MANTOU_VOICE_FILENAME
+    sample.write_bytes(b"export-me")
+    event = make_private_event(content="/导出馒头音色", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        bot.call_api = AsyncMock(return_value={"file_id": "file-1"})
+        ctx.should_call_send(
+            event, "馒头音色已导出：mantou_voice.wav（9 字节）", result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.export_mantou_voice_matcher)
+
+    bot.call_api.assert_awaited_once()
+    assert bot.call_api.await_args.args[0] == "upload_private_file"
+    kwargs = bot.call_api.await_args.kwargs
+    assert kwargs["user_id"] == SUPERUSER_ID
+    assert kwargs["name"] == "mantou_voice.wav"
+    assert kwargs["file"] == "base64://ZXhwb3J0LW1l"
+
+
+async def test_export_mantou_voice_without_sample(app: App, runtime, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        handlers.config,
+        "group_chat_memory_db_path_override",
+        str(tmp_path / "memory.db"),
+    )
+    event = make_private_event(content="/导出馒头音色", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, handlers.VOICE_EXPORT_MISSING, result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.export_mantou_voice_matcher)
+
+
+async def test_export_mantou_voice_rejects_group_chat(app: App, runtime):
+    event = make_group_event("/导出馒头音色", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, "请在私聊中导出馒头音色。", result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.export_mantou_voice_matcher)
+
+
+async def test_export_mantou_voice_requires_superuser(app: App, runtime):
+    event = make_private_event(content="/导出馒头音色", user_id=USER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, handlers.PERMISSION_DENIED, result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.export_mantou_voice_matcher)

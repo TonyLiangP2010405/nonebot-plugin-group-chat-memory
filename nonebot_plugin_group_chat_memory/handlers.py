@@ -7,6 +7,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlparse
 from weakref import WeakKeyDictionary
@@ -29,6 +30,7 @@ from .affection import AffectionLeaderboard
 from .api import ChatAPIError, ChatClient, EmbeddingClient
 from .config import (
     DEFAULT_TTS_VOICE_ID,
+    TTS_PROVIDERS,
     TTS_VOICES,
     get_settings,
 )
@@ -38,7 +40,7 @@ from .memory import MemoryWriter
 from .models import Message as MemoryMessage
 from .replies import ReplyCoordinator
 from .store import MemoryStore
-from .tts import TTSClient
+from .tts import QwenTTSClient, TTSClient
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +65,44 @@ VOICE_LIST_USAGE = (
 )
 VOICE_USAGE = "请引用一条文字消息，再发送 /语音。"
 VOICE_NOT_CONFIGURED = "语音合成未配置，请 SUPERUSER 私聊发送 /设置语音密钥。"
+QWEN_VOICE_NOT_CONFIGURED = (
+    "Qwen 语音未配置完整，请私聊 SUPERUSER 设置"
+    " /设置阿里云密钥、/设置阿里云空间 和 /设置语音参考。"
+)
 INVALID_VOICE_ID = "语音音色只能是 stella（女声）或 tide（男声）。"
+INVALID_VOICE_MODEL = "语音模型只能是 deepseek 或 qwen。"
+INVALID_QWEN_WORKSPACE = "阿里云百炼业务空间 ID 只能包含字母、数字、下划线和短横线。"
+INVALID_QWEN_REFERENCE = (
+    "参考音频需为 http(s) URL，或服务器上的 WAV/MP3/OGG 文件路径，且不超过 10 MB。"
+)
+QWEN_REFERENCE_MAX_BYTES = 10 * 1024 * 1024
+VOICE_PROVIDER_ALIASES = {
+    "deepseek": "deepseek",
+    "deepseek-tts": "deepseek",
+    "deepseek tts": "deepseek",
+    "qwen": "qwen",
+    "qwen-audio": "qwen",
+    "qwen-audio-3.1-tts-next": "qwen",
+    "阿里云": "qwen",
+    "阿里": "qwen",
+    "通义": "qwen",
+}
+QWEN_REFERENCE_SUFFIXES = {".wav", ".mp3", ".ogg", ".opus"}
+MANTOU_VOICE_FILENAME = "mantou_voice.wav"
+MANTOU_VOICE_DESCRIPTION = (
+    "一位偏萝莉的年轻少女音，音色清亮、软萌、活泼，语速稍快，"
+    "像群聊里随口聊天，不要播音腔，不要气声，不要背景音乐和音效。"
+)
+MANTOU_VOICE_SAMPLE = (
+    "确实，今天这局打得有点抽象。刚才那波我明明想撤，结果手一抖又冲上去了。"
+    "没事，输了就输了，明天再战。你们也别笑，换你们上也一样。"
+    "行了，先吃饭，吃完再说。"
+)
+VOICE_SAMPLE_NOT_CONFIGURED = (
+    "生成馒头音色需要先配置阿里云：私聊发送 /设置阿里云密钥 和 /设置阿里云空间。"
+)
+VOICE_SAMPLE_FAILED = "馒头音色生成失败，请稍后重试或检查阿里云配置。"
+VOICE_EXPORT_MISSING = "还没有生成馒头音色，请先私聊发送 /生成馒头音色。"
 VOICE_ALIASES = {
     "stella": "stella",
     "女声": "stella",
@@ -87,7 +126,7 @@ AFFECTION_SWITCH_OFF = {"关", "关闭", "off", "0", "false"}
 RATE_LIMIT_NOTICE = "本群本小时请求次数已用完，请稍后再来。"
 PROBABILITY_PATTERN = re.compile(r"(?:100(?:\.0)?|\d{1,2}(?:\.\d)?)")
 SECRET_COMMAND_LOG_PATTERN = re.compile(
-    r"(设置聊天密钥|设置向量密钥|设置语音密钥)\s+[^\r\n]*"
+    r"(设置聊天密钥|设置向量密钥|设置语音密钥|设置阿里云密钥)\s+[^\r\n]*"
 )
 
 
@@ -104,6 +143,7 @@ writer = MemoryWriter(config, store, embedding_client)
 context_builder = ContextBuilder(config, store, embedding_client)
 chat_client = ChatClient(config)
 tts_client = TTSClient(config)
+qwen_tts_client = QwenTTSClient(config)
 meme_provider: MemeProvider
 
 
@@ -154,6 +194,40 @@ def _voice_label(voice_id: str) -> str:
     return TTS_VOICES.get(voice_id.strip().lower(), TTS_VOICES[DEFAULT_TTS_VOICE_ID])
 
 
+def _voice_provider() -> str:
+    provider = config.group_chat_memory_tts_provider.strip().lower()
+    return provider if provider in TTS_PROVIDERS else "deepseek"
+
+
+def _provider_label(provider: str) -> str:
+    return TTS_PROVIDERS.get(provider, TTS_PROVIDERS["deepseek"])
+
+
+def _voice_configured() -> bool:
+    if _voice_provider() == "qwen":
+        return bool(
+            config.group_chat_memory_qwen_api_key.get_secret_value().strip()
+            and config.group_chat_memory_qwen_workspace_id.strip()
+            and config.group_chat_memory_qwen_reference.strip()
+        )
+    return bool(config.group_chat_memory_tts_api_key.get_secret_value().strip())
+
+
+def _voice_not_configured_notice() -> str:
+    if _voice_provider() == "qwen":
+        return QWEN_VOICE_NOT_CONFIGURED
+    return VOICE_NOT_CONFIGURED
+
+
+def _reference_label(reference: str) -> str:
+    value = reference.strip()
+    if not value:
+        return "未配置"
+    if value.lower().startswith(("http://", "https://")):
+        return "已配置（URL）"
+    return f"已配置（{Path(value).name}）"
+
+
 async def _record_bot_reply(bot: Bot, group_id: int, text: str) -> None:
     await writer.record(
         MemoryMessage(
@@ -167,8 +241,8 @@ async def _record_bot_reply(bot: Bot, group_id: int, text: str) -> None:
 
 
 async def _voice_available(group_id: int, user_id: int) -> bool:
-    """语音只对榜一和语音名单成员开放；未配置语音密钥时视为不可用。"""
-    if not config.group_chat_memory_tts_api_key.get_secret_value().strip():
+    """语音只对榜一和语音名单成员开放；当前模型未配置完整时视为不可用。"""
+    if not _voice_configured():
         return False
     if await store.is_voice_member(group_id, user_id):
         return True
@@ -176,12 +250,15 @@ async def _voice_available(group_id: int, user_id: int) -> bool:
 
 
 async def _synthesize(text: str) -> bytes | None:
+    provider = _voice_provider()
     try:
+        if provider == "qwen":
+            return await qwen_tts_client.synthesize(text)
         return await tts_client.synthesize(
             text, voice_id=config.group_chat_memory_tts_voice_id
         )
     except Exception as exc:
-        logger.warning("语音合成失败：%s", type(exc).__name__)
+        logger.warning("语音合成失败（%s）：%s", provider, type(exc).__name__)
         return None
 
 
@@ -350,8 +427,12 @@ async def apply_setting(key: str, value: str) -> None:
             "chat_api_key": config.group_chat_memory_chat_api_key.get_secret_value(),
             "chat_model": config.group_chat_memory_chat_model,
             "embedding_api_key": config.group_chat_memory_embedding_api_key.get_secret_value(),
+            "tts_provider": config.group_chat_memory_tts_provider,
             "tts_api_key": config.group_chat_memory_tts_api_key.get_secret_value(),
             "tts_voice_id": config.group_chat_memory_tts_voice_id,
+            "qwen_api_key": config.group_chat_memory_qwen_api_key.get_secret_value(),
+            "qwen_workspace_id": config.group_chat_memory_qwen_workspace_id,
+            "qwen_reference": config.group_chat_memory_qwen_reference,
             "apihz_id": config.group_chat_memory_apihz_id,
             "apihz_key": config.group_chat_memory_apihz_key.get_secret_value(),
         }
@@ -368,6 +449,12 @@ chat_model_matcher = on_command("设置聊天模型", priority=-1001, block=True
 embedding_key_matcher = on_command("设置向量密钥", priority=-1001, block=True)
 voice_key_matcher = on_command("设置语音密钥", priority=-1001, block=True)
 voice_id_matcher = on_command("设置语音音色", priority=-1001, block=True)
+voice_model_matcher = on_command("设置语音模型", priority=-1001, block=True)
+qwen_key_matcher = on_command("设置阿里云密钥", priority=-1001, block=True)
+qwen_workspace_matcher = on_command("设置阿里云空间", priority=-1001, block=True)
+qwen_reference_matcher = on_command("设置语音参考", priority=-1001, block=True)
+mantou_voice_matcher = on_command("生成馒头音色", priority=-1001, block=True)
+export_mantou_voice_matcher = on_command("导出馒头音色", priority=-1001, block=True)
 meme_id_matcher = on_command("设置表情包ID", priority=-1001, block=True)
 meme_key_matcher = on_command("设置表情包密钥", priority=-1001, block=True)
 model_config_matcher = on_command("模型配置", priority=-1001, block=True)
@@ -472,6 +559,188 @@ async def handle_voice_id(
     await voice_id_matcher.finish(f"语音音色已设置为：{_voice_label(voice_id)}。")
 
 
+@voice_model_matcher.handle()
+async def handle_voice_model(
+    bot: Bot,
+    event: MessageEvent,
+    args: Annotated[Message, CommandArg()],
+) -> None:
+    if not isinstance(event, PrivateMessageEvent):
+        await voice_model_matcher.finish("请在私聊中设置语音模型。")
+    if not await SUPERUSER(bot, event):
+        await voice_model_matcher.finish(PERMISSION_DENIED)
+
+    text = args.extract_plain_text().strip().lower()
+    if not text:
+        await voice_model_matcher.finish(
+            f"当前语音模型：{_provider_label(_voice_provider())}"
+        )
+    provider = VOICE_PROVIDER_ALIASES.get(text)
+    if provider is None:
+        await voice_model_matcher.finish(INVALID_VOICE_MODEL)
+    try:
+        await apply_setting("tts_provider", provider)
+    except Exception as exc:
+        logger.error("保存语音模型失败：%s", type(exc).__name__)
+        await voice_model_matcher.finish("配置保存失败，请稍后再试。")
+    await voice_model_matcher.finish(
+        f"语音模型已切换为：{_provider_label(provider)}。"
+    )
+
+
+@qwen_key_matcher.handle()
+async def handle_qwen_key(
+    bot: Bot, event: MessageEvent, args: Annotated[Message, CommandArg()]
+) -> None:
+    await _handle_setting(qwen_key_matcher, bot, event, args, "qwen_api_key")
+
+
+@qwen_workspace_matcher.handle()
+async def handle_qwen_workspace(
+    bot: Bot,
+    event: MessageEvent,
+    args: Annotated[Message, CommandArg()],
+) -> None:
+    if not isinstance(event, PrivateMessageEvent):
+        await qwen_workspace_matcher.finish("请在私聊中设置阿里云空间。")
+    if not await SUPERUSER(bot, event):
+        await qwen_workspace_matcher.finish(PERMISSION_DENIED)
+
+    text = args.extract_plain_text().strip()
+    if not text:
+        await qwen_workspace_matcher.finish(
+            f"当前阿里云空间：{config.group_chat_memory_qwen_workspace_id or '未配置'}"
+        )
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", text):
+        await qwen_workspace_matcher.finish(INVALID_QWEN_WORKSPACE)
+    try:
+        await apply_setting("qwen_workspace_id", text)
+    except Exception as exc:
+        logger.error("保存阿里云空间失败：%s", type(exc).__name__)
+        await qwen_workspace_matcher.finish("配置保存失败，请稍后再试。")
+    await qwen_workspace_matcher.finish("阿里云百炼业务空间已更新。")
+
+
+@qwen_reference_matcher.handle()
+async def handle_qwen_reference(
+    bot: Bot,
+    event: MessageEvent,
+    args: Annotated[Message, CommandArg()],
+) -> None:
+    if not isinstance(event, PrivateMessageEvent):
+        await qwen_reference_matcher.finish("请在私聊中设置语音参考。")
+    if not await SUPERUSER(bot, event):
+        await qwen_reference_matcher.finish(PERMISSION_DENIED)
+
+    text = args.extract_plain_text().strip()
+    if not text:
+        await qwen_reference_matcher.finish(
+            f"当前语音参考：{_reference_label(config.group_chat_memory_qwen_reference)}"
+        )
+    if text.lower() in {"清除", "清空", "none", "off", "reset"}:
+        try:
+            await apply_setting("qwen_reference", "")
+        except Exception as exc:
+            logger.error("清空语音参考失败：%s", type(exc).__name__)
+            await qwen_reference_matcher.finish("配置保存失败，请稍后再试。")
+        await qwen_reference_matcher.finish("语音参考已清除。")
+
+    value = text
+    if value.lower().startswith(("http://", "https://")):
+        if not _valid_http_url(value):
+            await qwen_reference_matcher.finish(INVALID_QWEN_REFERENCE)
+    else:
+        path = Path(value).expanduser()
+        if (
+            not path.is_file()
+            or path.suffix.lower() not in QWEN_REFERENCE_SUFFIXES
+            or path.stat().st_size > QWEN_REFERENCE_MAX_BYTES
+        ):
+            await qwen_reference_matcher.finish(INVALID_QWEN_REFERENCE)
+        value = str(path.resolve())
+
+    try:
+        await apply_setting("qwen_reference", value)
+    except Exception as exc:
+        logger.error("保存语音参考失败：%s", type(exc).__name__)
+        await qwen_reference_matcher.finish("配置保存失败，请稍后再试。")
+    await qwen_reference_matcher.finish("语音参考已更新。")
+
+
+@mantou_voice_matcher.handle()
+async def handle_mantou_voice(bot: Bot, event: MessageEvent) -> None:
+    if not isinstance(event, PrivateMessageEvent):
+        await mantou_voice_matcher.finish("请在私聊中生成馒头音色。")
+    if not await SUPERUSER(bot, event):
+        await mantou_voice_matcher.finish(PERMISSION_DENIED)
+    if not (
+        config.group_chat_memory_qwen_api_key.get_secret_value().strip()
+        and config.group_chat_memory_qwen_workspace_id.strip()
+    ):
+        await mantou_voice_matcher.finish(VOICE_SAMPLE_NOT_CONFIGURED)
+
+    try:
+        audio = await qwen_tts_client.generate_sample(
+            MANTOU_VOICE_SAMPLE, description=MANTOU_VOICE_DESCRIPTION
+        )
+    except Exception as exc:
+        logger.warning("生成馒头音色失败：%s", type(exc).__name__)
+        await mantou_voice_matcher.finish(VOICE_SAMPLE_FAILED)
+
+    if len(audio) > QWEN_REFERENCE_MAX_BYTES:
+        await mantou_voice_matcher.finish("生成的馒头音色文件过大，请重试。")
+
+    path = config.database_path.parent / MANTOU_VOICE_FILENAME
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(audio)
+        await apply_setting("qwen_reference", str(path))
+        await apply_setting("tts_provider", "qwen")
+    except Exception as exc:
+        logger.error("保存馒头音色失败：%s", type(exc).__name__)
+        await mantou_voice_matcher.finish("馒头音色保存失败，请稍后再试。")
+
+    await mantou_voice_matcher.finish(
+        "馒头固定音色已生成并保存，已切换为 Qwen 语音。"
+        "之后 /语音 和自动语音都会使用这个偏萝莉的少女音。"
+    )
+
+
+@export_mantou_voice_matcher.handle()
+async def handle_export_mantou_voice(bot: Bot, event: MessageEvent) -> None:
+    if not isinstance(event, PrivateMessageEvent):
+        await export_mantou_voice_matcher.finish("请在私聊中导出馒头音色。")
+    if not await SUPERUSER(bot, event):
+        await export_mantou_voice_matcher.finish(PERMISSION_DENIED)
+
+    path = config.database_path.parent / MANTOU_VOICE_FILENAME
+    if not path.is_file():
+        await export_mantou_voice_matcher.finish(VOICE_EXPORT_MISSING)
+
+    audio = path.read_bytes()
+    encoded = base64.b64encode(audio).decode()
+    try:
+        await bot.call_api(
+            "upload_private_file",
+            user_id=event.user_id,
+            file=f"base64://{encoded}",
+            name=MANTOU_VOICE_FILENAME,
+        )
+    except Exception as exc:
+        logger.warning("导出馒头音色文件失败：%s", type(exc).__name__)
+        try:
+            await bot.send_private_msg(
+                user_id=event.user_id,
+                message=MessageSegment.record(f"base64://{encoded}"),
+            )
+        except Exception as voice_exc:
+            logger.warning("导出馒头音色语音失败：%s", type(voice_exc).__name__)
+            await export_mantou_voice_matcher.finish("馒头音色导出失败，请稍后再试。")
+    await export_mantou_voice_matcher.finish(
+        f"馒头音色已导出：{MANTOU_VOICE_FILENAME}（{len(audio)} 字节）"
+    )
+
+
 @meme_id_matcher.handle()
 async def handle_meme_id(
     bot: Bot, event: MessageEvent, args: Annotated[Message, CommandArg()]
@@ -500,8 +769,13 @@ async def handle_model_config(bot: Bot, event: MessageEvent) -> None:
         f"聊天密钥：{status(config.group_chat_memory_chat_api_key.get_secret_value())}\n"
         "Embedding 密钥："
         f"{status(config.group_chat_memory_embedding_api_key.get_secret_value())}\n"
+        f"语音模型：{_provider_label(_voice_provider())}\n"
         f"语音密钥：{status(config.group_chat_memory_tts_api_key.get_secret_value())}\n"
         f"语音音色：{_voice_label(config.group_chat_memory_tts_voice_id)}\n"
+        "阿里云密钥："
+        f"{status(config.group_chat_memory_qwen_api_key.get_secret_value())}\n"
+        f"阿里云空间：{config.group_chat_memory_qwen_workspace_id or '未配置'}\n"
+        f"语音参考：{_reference_label(config.group_chat_memory_qwen_reference)}\n"
         f"接口 ID：{config.group_chat_memory_apihz_id or '未配置'}\n"
         f"接口密钥：{status(config.group_chat_memory_apihz_key.get_secret_value())}"
     )
@@ -805,8 +1079,8 @@ async def handle_voice_list(
 async def handle_voice(bot: Bot, event: GroupMessageEvent) -> None:
     if not await SUPERUSER(bot, event):
         await voice_matcher.finish(PERMISSION_DENIED)
-    if not config.group_chat_memory_tts_api_key.get_secret_value().strip():
-        await voice_matcher.finish(VOICE_NOT_CONFIGURED)
+    if not _voice_configured():
+        await voice_matcher.finish(_voice_not_configured_notice())
     if event.reply is None:
         await voice_matcher.finish(VOICE_USAGE)
 

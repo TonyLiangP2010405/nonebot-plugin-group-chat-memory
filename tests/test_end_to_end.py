@@ -20,7 +20,7 @@ from nonebot_plugin_group_chat_memory.context import MEMORY_SECTION_TITLE, Conte
 from nonebot_plugin_group_chat_memory.memory import MemoryWriter
 from nonebot_plugin_group_chat_memory.replies import ReplyCoordinator
 from nonebot_plugin_group_chat_memory.store import MemoryStore
-from nonebot_plugin_group_chat_memory.tts import TTSClient
+from nonebot_plugin_group_chat_memory.tts import QwenTTSClient, TTSClient
 
 BOT_ID = 10000
 GROUP_A = 20002
@@ -89,6 +89,7 @@ async def integrated_runtime(monkeypatch, tmp_path):
     monkeypatch.setattr(handlers, "context_builder", ContextBuilder(config, store, embedding))
     monkeypatch.setattr(handlers, "chat_client", ChatClient(config, retry_delays=()))
     monkeypatch.setattr(handlers, "tts_client", TTSClient(config, retry_delays=()))
+    monkeypatch.setattr(handlers, "qwen_tts_client", QwenTTSClient(config, retry_delays=()))
     monkeypatch.setattr(handlers, "coordinator", coordinator)
     handlers._bots.clear()
     await store.open()
@@ -326,3 +327,52 @@ async def test_voice_reply_sends_record_and_records_text(app: App, integrated_ru
     messages = await integrated_runtime.store.recent_messages(GROUP_A, 20)
     assert messages[-1].text == "语音回复内容"
     assert messages[-1].is_bot is True
+
+
+@respx.mock
+async def test_qwen_voice_reply_clones_reference_and_sends_record(
+    app: App, integrated_runtime
+):
+    respx.post("https://embedding.example/v1/embeddings").respond(
+        json=embedding_payload([[1.0, 0.0]])
+    )
+    respx.post("https://chat.example/v1/chat/completions").respond(
+        json=chat_payload("Qwen 语音回复")
+    )
+    respx.post(
+        "https://ws-test.cn-beijing.maas.aliyuncs.com"
+        "/api/v1/services/audio/tts/SpeechSynthesizer"
+    ).respond(200, json={"output": {"audio": {"url": "https://cdn.example/qwen.wav"}}})
+    respx.get("https://cdn.example/qwen.wav").respond(
+        200, content=b"qwen-wav", headers={"content-type": "audio/wav"}
+    )
+
+    await handlers.apply_setting("tts_provider", "qwen")
+    await handlers.apply_setting("qwen_api_key", "sk-qwen")
+    await handlers.apply_setting("qwen_workspace_id", "ws-test")
+    await handlers.apply_setting(
+        "qwen_reference", "https://example.com/reference.wav"
+    )
+    await integrated_runtime.store.add_voice_member(GROUP_A, USER_ID)
+    handlers.coordinator._random_value = lambda: 0.9  # type: ignore[attr-defined]
+    event = group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text(" 用她的声音说 ")]),
+        to_me=True,
+        message_id=31,
+    )
+    encoded = base64.b64encode(b"qwen-wav").decode()
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        send_group_msg = AsyncMock(return_value={"message_id": 123})
+        bot.send_group_msg = send_group_msg
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_for_message_count(integrated_runtime.store, GROUP_A, 2)
+
+    send_group_msg.assert_awaited_once_with(
+        group_id=GROUP_A,
+        message=MessageSegment.record(f"base64://{encoded}"),
+    )
+    messages = await integrated_runtime.store.recent_messages(GROUP_A, 20)
+    assert messages[-1].text == "Qwen 语音回复"
