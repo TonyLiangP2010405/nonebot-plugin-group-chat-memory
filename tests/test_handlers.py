@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -20,6 +21,7 @@ from nonebot.adapters.onebot.v11.event import Anonymous, Reply, Sender
 from nonebot.exception import StopPropagation
 from nonebot.message import handle_event
 from nonebug import App
+from pydantic import SecretStr
 
 from nonebot_plugin_group_chat_memory import handlers
 from nonebot_plugin_group_chat_memory.api import ChatAPIError
@@ -28,6 +30,7 @@ from nonebot_plugin_group_chat_memory.models import ChatContext
 from nonebot_plugin_group_chat_memory.models import Message as MemoryMessage
 from nonebot_plugin_group_chat_memory.replies import ReplyCoordinator
 from nonebot_plugin_group_chat_memory.store import MemoryStore
+from nonebot_plugin_group_chat_memory.tts import TTSError
 
 BOT_ID = 10000
 GROUP_ID = 20002
@@ -98,6 +101,17 @@ def bot_reply() -> Reply:
     )
 
 
+def quoted_reply(text: str = "被引用的话", *, message_id: int = 88) -> Reply:
+    return Reply(
+        time=1_699_999_999,
+        message_type="group",
+        message_id=message_id,
+        real_id=message_id,
+        sender=Sender(user_id=USER_ID, nickname="昵称"),
+        message=Message(text),
+    )
+
+
 async def wait_until(predicate, timeout: float = 1.0) -> None:
     async def poll() -> None:
         while not predicate():
@@ -113,8 +127,6 @@ async def runtime(monkeypatch):
     complete = AsyncMock(return_value="模型回复")
     get_probability = AsyncMock(return_value=0.0)
     set_probability = AsyncMock()
-    get_quote_probability = AsyncMock(return_value=0.0)
-    set_quote_probability = AsyncMock()
     clear_group = AsyncMock()
     get_hourly_limit = AsyncMock(return_value=10)
     set_hourly_limit = AsyncMock()
@@ -124,12 +136,20 @@ async def runtime(monkeypatch):
     set_affection_probability = AsyncMock()
     get_superuser_always_reply = AsyncMock(return_value=True)
     set_superuser_always_reply = AsyncMock()
+    get_meme_enabled = AsyncMock(return_value=True)
+    set_meme_enabled = AsyncMock()
     is_always_reply = AsyncMock(return_value=False)
     add_always_reply = AsyncMock(return_value=True)
     remove_always_reply = AsyncMock(return_value=True)
     clear_always_reply = AsyncMock(return_value=1)
     list_always_reply = AsyncMock(return_value=[])
+    is_voice_member = AsyncMock(return_value=False)
+    add_voice_member = AsyncMock(return_value=True)
+    remove_voice_member = AsyncMock(return_value=True)
+    clear_voice_member = AsyncMock(return_value=1)
+    list_voice_member = AsyncMock(return_value=[])
     list_groups = AsyncMock(return_value=[])
+    synthesize = AsyncMock(return_value=b"audio-bytes")
     consume_request_slot = AsyncMock(return_value=True)
     meme = AsyncMock()
     meme.fetch.return_value = "https://img/reply.png"
@@ -139,8 +159,6 @@ async def runtime(monkeypatch):
     monkeypatch.setattr(handlers.chat_client, "complete", complete)
     monkeypatch.setattr(handlers.store, "get_probability", get_probability)
     monkeypatch.setattr(handlers.store, "set_probability", set_probability)
-    monkeypatch.setattr(handlers.store, "get_quote_probability", get_quote_probability)
-    monkeypatch.setattr(handlers.store, "set_quote_probability", set_quote_probability)
     monkeypatch.setattr(handlers.store, "clear_group", clear_group)
     monkeypatch.setattr(handlers.store, "get_hourly_limit", get_hourly_limit)
     monkeypatch.setattr(handlers.store, "set_hourly_limit", set_hourly_limit)
@@ -158,14 +176,24 @@ async def runtime(monkeypatch):
     monkeypatch.setattr(
         handlers.store, "set_superuser_always_reply", set_superuser_always_reply
     )
+    monkeypatch.setattr(handlers.store, "get_meme_enabled", get_meme_enabled)
+    monkeypatch.setattr(handlers.store, "set_meme_enabled", set_meme_enabled)
     monkeypatch.setattr(handlers.store, "consume_request_slot", consume_request_slot)
     monkeypatch.setattr(handlers.store, "is_always_reply", is_always_reply)
     monkeypatch.setattr(handlers.store, "add_always_reply", add_always_reply)
     monkeypatch.setattr(handlers.store, "remove_always_reply", remove_always_reply)
     monkeypatch.setattr(handlers.store, "clear_always_reply", clear_always_reply)
     monkeypatch.setattr(handlers.store, "list_always_reply", list_always_reply)
+    monkeypatch.setattr(handlers.store, "is_voice_member", is_voice_member)
+    monkeypatch.setattr(handlers.store, "add_voice_member", add_voice_member)
+    monkeypatch.setattr(handlers.store, "remove_voice_member", remove_voice_member)
+    monkeypatch.setattr(handlers.store, "clear_voice_member", clear_voice_member)
+    monkeypatch.setattr(handlers.store, "list_voice_member", list_voice_member)
     monkeypatch.setattr(handlers.store, "list_groups", list_groups)
-    coordinator = ReplyCoordinator(handlers.store, handlers.reply)
+    monkeypatch.setattr(handlers.tts_client, "synthesize", synthesize)
+    coordinator = ReplyCoordinator(
+        handlers.store, handlers.reply, random_value=lambda: 0.0
+    )
     monkeypatch.setattr(handlers, "coordinator", coordinator)
     saved_config = {
         field: getattr(handlers.config, field)
@@ -174,10 +202,14 @@ async def runtime(monkeypatch):
             "group_chat_memory_chat_api_key",
             "group_chat_memory_chat_model",
             "group_chat_memory_embedding_api_key",
+            "group_chat_memory_tts_api_key",
+            "group_chat_memory_tts_voice_id",
             "group_chat_memory_apihz_id",
             "group_chat_memory_apihz_key",
         )
     }
+    handlers.config.group_chat_memory_tts_api_key = SecretStr("sk-tts")
+    handlers.config.group_chat_memory_tts_voice_id = "stella"
     handlers._bots.clear()
     handlers._private_drafts.clear()
     try:
@@ -187,8 +219,6 @@ async def runtime(monkeypatch):
             complete=complete,
             get_probability=get_probability,
             set_probability=set_probability,
-            get_quote_probability=get_quote_probability,
-            set_quote_probability=set_quote_probability,
             clear_group=clear_group,
             get_hourly_limit=get_hourly_limit,
             set_hourly_limit=set_hourly_limit,
@@ -198,13 +228,21 @@ async def runtime(monkeypatch):
             set_affection_probability=set_affection_probability,
             get_superuser_always_reply=get_superuser_always_reply,
             set_superuser_always_reply=set_superuser_always_reply,
+            get_meme_enabled=get_meme_enabled,
+            set_meme_enabled=set_meme_enabled,
             consume_request_slot=consume_request_slot,
             is_always_reply=is_always_reply,
             add_always_reply=add_always_reply,
             remove_always_reply=remove_always_reply,
             clear_always_reply=clear_always_reply,
             list_always_reply=list_always_reply,
+            is_voice_member=is_voice_member,
+            add_voice_member=add_voice_member,
+            remove_voice_member=remove_voice_member,
+            clear_voice_member=clear_voice_member,
+            list_voice_member=list_voice_member,
             list_groups=list_groups,
+            synthesize=synthesize,
             coordinator=coordinator,
             meme=meme,
         )
@@ -508,69 +546,8 @@ async def test_probability_setting_rejects_invalid_input(app: App, runtime, valu
     runtime.complete.assert_not_awaited()
 
 
-async def test_quote_probability_query_is_superuser_only_and_uses_one_decimal(
-    app: App, runtime
-):
-    runtime.get_quote_probability.return_value = 12.26
-    event = make_group_event("/引用概率", user_id=SUPERUSER_ID)
-
-    async with app.test_matcher() as ctx:
-        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
-        ctx.should_call_send(event, "当前群引用回复概率：12.3%", result=None, bot=bot)
-        ctx.receive_event(bot, event)
-        ctx.should_finished(handlers.quote_probability_matcher)
-
-    runtime.get_quote_probability.assert_awaited_once_with(GROUP_ID)
-    runtime.record.assert_not_awaited()
-    runtime.complete.assert_not_awaited()
-
-
-@pytest.mark.parametrize(
-    ("value", "expected"), [("0", 0.0), ("0.0", 0.0), ("5.5", 5.5), ("100", 100.0)]
-)
-async def test_quote_probability_setting_accepts_one_decimal(
-    app: App, runtime, value, expected
-):
-    event = make_group_event(f"/引用概率 {value}", user_id=SUPERUSER_ID)
-
-    async with app.test_matcher() as ctx:
-        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
-        ctx.should_call_send(
-            event, f"已设置当前群引用回复概率：{expected:.1f}%", result=None, bot=bot
-        )
-        ctx.receive_event(bot, event)
-        ctx.should_finished(handlers.quote_probability_matcher)
-
-    runtime.set_quote_probability.assert_awaited_once_with(GROUP_ID, expected)
-    runtime.get_quote_probability.assert_not_awaited()
-    runtime.record.assert_not_awaited()
-    runtime.complete.assert_not_awaited()
-
-
-@pytest.mark.parametrize("value", ["-1", "100.1", "1.23", ".5", "5.", "abc", "nan"])
-async def test_quote_probability_setting_rejects_invalid_input(app: App, runtime, value):
-    event = make_group_event(f"/引用概率 {value}", user_id=SUPERUSER_ID)
-
-    async with app.test_matcher() as ctx:
-        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
-        ctx.should_call_send(
-            event,
-            "引用概率需为 0～100 的数字，最多一位小数。",
-            result=None,
-            bot=bot,
-        )
-        ctx.receive_event(bot, event)
-        ctx.should_finished(handlers.quote_probability_matcher)
-
-    runtime.set_quote_probability.assert_not_awaited()
-    runtime.record.assert_not_awaited()
-    runtime.complete.assert_not_awaited()
-
-
-async def test_reply_quotes_trigger_message_when_quote_probability_is_100(
-    app: App, runtime
-):
-    runtime.get_quote_probability.return_value = 100.0
+async def test_reply_uses_quote_mode_on_middle_roll(app: App, runtime, monkeypatch):
+    use_random(monkeypatch, 0.5)
     event = make_group_event(
         Message([MessageSegment.at(BOT_ID), MessageSegment.text("你好")]),
         to_me=True,
@@ -587,23 +564,20 @@ async def test_reply_quotes_trigger_message_when_quote_probability_is_100(
 
     send_group_msg.assert_awaited_once_with(
         group_id=GROUP_ID,
-        message=Message(
-            [MessageSegment.reply(321), MessageSegment.text("模型回复")]
-        ),
+        message=Message([MessageSegment.reply(321), MessageSegment.text("模型回复")]),
     )
-    runtime.get_quote_probability.assert_awaited_once_with(GROUP_ID)
     assert runtime.record.await_args_list[-1].args[0].text == "模型回复"
 
 
-async def test_generic_error_is_quoted_when_quote_probability_is_100(
-    app: App, runtime
+async def test_voice_member_gets_voice_reply_on_high_roll(
+    app: App, runtime, monkeypatch
 ):
-    runtime.get_quote_probability.return_value = 100.0
-    runtime.complete.side_effect = ConfigError("缺少密钥")
+    runtime.is_voice_member.return_value = True
+    use_random(monkeypatch, 0.9)
     event = make_group_event(
         Message([MessageSegment.at(BOT_ID), MessageSegment.text("你好")]),
         to_me=True,
-        message_id=77,
+        message_id=321,
     )
 
     async with app.test_matcher() as ctx:
@@ -612,18 +586,63 @@ async def test_generic_error_is_quoted_when_quote_probability_is_100(
         bot.send_group_msg = send_group_msg
         ctx.receive_event(bot, event)
         await ctx.run()
-        await wait_until(lambda: send_group_msg.await_count == 1)
+        await wait_until(lambda: runtime.record.await_count == 2)
 
+    encoded = base64.b64encode(b"audio-bytes").decode()
     send_group_msg.assert_awaited_once_with(
         group_id=GROUP_ID,
-        message=Message(
-            [
-                MessageSegment.reply(77),
-                MessageSegment.text("暂时无法生成回复，请稍后再试。"),
-            ]
-        ),
+        message=MessageSegment.record(f"base64://{encoded}"),
     )
-    assert runtime.record.await_count == 1
+    runtime.synthesize.assert_awaited_once_with("模型回复", voice_id="stella")
+    assert runtime.record.await_args_list[-1].args[0].text == "模型回复"
+
+
+async def test_voice_tts_failure_falls_back_to_text(
+    app: App, runtime, monkeypatch
+):
+    runtime.is_voice_member.return_value = True
+    runtime.synthesize.side_effect = TTSError("boom")
+    use_random(monkeypatch, 0.9)
+    event = make_group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text("你好")]),
+        to_me=True,
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        send_group_msg = AsyncMock(return_value={"message_id": 123})
+        bot.send_group_msg = send_group_msg
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_until(lambda: runtime.record.await_count == 2)
+
+    send_group_msg.assert_awaited_once_with(
+        group_id=GROUP_ID, message=MessageSegment.text("模型回复")
+    )
+    assert runtime.record.await_args_list[-1].args[0].text == "模型回复"
+
+
+async def test_ineligible_voice_share_falls_back_to_text(
+    app: App, runtime, monkeypatch
+):
+    use_random(monkeypatch, 0.9)
+    event = make_group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text("你好")]),
+        to_me=True,
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        send_group_msg = AsyncMock(return_value={"message_id": 123})
+        bot.send_group_msg = send_group_msg
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_until(lambda: runtime.record.await_count == 2)
+
+    send_group_msg.assert_awaited_once_with(
+        group_id=GROUP_ID, message=MessageSegment.text("模型回复")
+    )
+    runtime.synthesize.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -631,12 +650,11 @@ async def test_generic_error_is_quoted_when_quote_probability_is_100(
     [
         "/回复概率",
         "/回复概率 50",
-        "/引用概率",
-        "/引用概率 50",
         "/清空群记忆",
         "/每小时次数 20",
         "/好感概率 30",
         "/好感开关 关",
+        "/表情包开关 关",
     ],
 )
 async def test_non_superuser_gets_short_denial_without_side_effects(
@@ -652,8 +670,8 @@ async def test_non_superuser_gets_short_denial_without_side_effects(
 
     runtime.get_probability.assert_not_awaited()
     runtime.set_probability.assert_not_awaited()
-    runtime.get_quote_probability.assert_not_awaited()
-    runtime.set_quote_probability.assert_not_awaited()
+    runtime.get_meme_enabled.assert_not_awaited()
+    runtime.set_meme_enabled.assert_not_awaited()
     runtime.clear_group.assert_not_awaited()
     runtime.record.assert_not_awaited()
     runtime.complete.assert_not_awaited()
@@ -824,6 +842,12 @@ async def test_shutdown_continues_cleanup_after_close_failure(runtime, monkeypat
             "embedding-secret",
             "group_chat_memory_embedding_api_key",
         ),
+        (
+            "/设置语音密钥 tts-secret",
+            "tts_api_key",
+            "tts-secret",
+            "group_chat_memory_tts_api_key",
+        ),
     ],
 )
 async def test_private_superuser_updates_runtime_config_immediately(
@@ -880,7 +904,13 @@ async def test_private_non_superuser_cannot_update_config(app: App, runtime, mon
 
 @pytest.mark.parametrize(
     "command",
-    ["/设置聊天地址", "/设置聊天密钥", "/设置聊天模型", "/设置向量密钥"],
+    [
+        "/设置聊天地址",
+        "/设置聊天密钥",
+        "/设置聊天模型",
+        "/设置向量密钥",
+        "/设置语音密钥",
+    ],
 )
 async def test_setting_command_rejects_empty_argument(app: App, runtime, monkeypatch, command):
     setter = AsyncMock()
@@ -938,6 +968,8 @@ async def test_model_config_query_masks_both_secrets(app: App, runtime):
         "聊天模型：deepseek-v4.1-flash\n"
         "聊天密钥：已配置（****）\n"
         "Embedding 密钥：已配置（****）\n"
+        "语音密钥：未配置\n"
+        "语音音色：女声（stella）\n"
         "接口 ID：10023437\n"
         "接口密钥：已配置（****）"
     )
@@ -972,6 +1004,7 @@ async def test_failed_setting_write_preserves_running_config(runtime, monkeypatc
     [
         ("/设置聊天密钥 chat-log-secret", "chat-log-secret"),
         ("/设置向量密钥 embedding-log-secret", "embedding-log-secret"),
+        ("/设置语音密钥 tts-log-secret", "tts-log-secret"),
     ],
 )
 async def test_secret_commands_are_redacted_from_event_logs(
@@ -1049,6 +1082,10 @@ def test_group_commands_and_chat_have_highest_priority():
     assert handlers.chat_key_matcher.priority == -1001
     assert handlers.chat_model_matcher.priority == -1001
     assert handlers.embedding_key_matcher.priority == -1001
+    assert handlers.voice_key_matcher.priority == -1001
+    assert handlers.voice_id_matcher.priority == -1001
+    assert handlers.voice_list_matcher.priority == -1001
+    assert handlers.voice_matcher.priority == -1001
     assert handlers.model_config_matcher.priority == -1001
     assert handlers.group_message_matcher.priority == -1000
 
@@ -1195,7 +1232,7 @@ async def test_leaderboard_member_replies_at_thirty_percent(app: App, runtime, m
     finally:
         await coordinator.close()
 
-    assert leaderboard.calls == [(GROUP_ID, USER_ID), (GROUP_ID, USER_ID)]
+    assert leaderboard.calls == [(GROUP_ID, USER_ID)] * 3
     runtime.complete.assert_awaited_once()
 
 
@@ -1282,7 +1319,9 @@ async def test_affection_boost_can_be_disabled(app: App, runtime, monkeypatch):
     runtime.consume_request_slot.assert_not_awaited()
 
 
-async def test_directed_message_skips_leaderboard_lookup(app: App, runtime, monkeypatch):
+async def test_directed_message_skips_reply_probability_leaderboard_lookup(
+    app: App, runtime, monkeypatch
+):
     runtime.get_probability.return_value = 100.0
     leaderboard = FakeLeaderboard({USER_ID})
     monkeypatch.setattr(handlers, "affection_leaderboard", leaderboard)
@@ -1301,7 +1340,7 @@ async def test_directed_message_skips_leaderboard_lookup(app: App, runtime, monk
         await ctx.run()
         await wait_until(lambda: runtime.record.await_count == 2)
 
-    assert leaderboard.calls == []
+    assert leaderboard.calls == [(GROUP_ID, USER_ID)]
     runtime.get_probability.assert_not_awaited()
 
 
@@ -1502,7 +1541,7 @@ async def test_affection_command_changes_real_store_and_reply(app: App, monkeypa
     monkeypatch.setattr(handlers.context_builder, "build", AsyncMock(return_value=ChatContext()))
     monkeypatch.setattr(handlers.chat_client, "complete", AsyncMock(return_value="模型回复"))
     monkeypatch.setattr(handlers, "affection_leaderboard", FakeLeaderboard({USER_ID}))
-    coordinator = ReplyCoordinator(store, handlers.reply)
+    coordinator = ReplyCoordinator(store, handlers.reply, random_value=lambda: 0.0)
     monkeypatch.setattr(handlers, "coordinator", coordinator)
     handlers._bots.clear()
 
@@ -1528,10 +1567,7 @@ async def test_affection_command_changes_real_store_and_reply(app: App, monkeypa
             await wait_until(lambda: handlers.writer.record.await_count == 2)
 
         send_group_msg.assert_awaited_once_with(
-            group_id=GROUP_ID,
-            message=Message(
-                [MessageSegment.reply(1), MessageSegment.text("模型回复")]
-            ),
+            group_id=GROUP_ID, message=MessageSegment.text("模型回复")
         )
         assert await store.get_affection_enabled(GROUP_ID) is True
         handlers.chat_client.complete.assert_awaited_once()
@@ -1849,7 +1885,7 @@ async def test_always_reply_command_changes_real_store_and_reply(
     monkeypatch.setattr(handlers.writer, "record", AsyncMock())
     monkeypatch.setattr(handlers.context_builder, "build", AsyncMock(return_value=ChatContext()))
     monkeypatch.setattr(handlers.chat_client, "complete", AsyncMock(return_value="模型回复"))
-    coordinator = ReplyCoordinator(store, handlers.reply)
+    coordinator = ReplyCoordinator(store, handlers.reply, random_value=lambda: 0.0)
     monkeypatch.setattr(handlers, "coordinator", coordinator)
     handlers._bots.clear()
 
@@ -1874,10 +1910,7 @@ async def test_always_reply_command_changes_real_store_and_reply(
             await wait_until(lambda: handlers.writer.record.await_count == 2)
 
         send_group_msg.assert_awaited_once_with(
-            group_id=GROUP_ID,
-            message=Message(
-                [MessageSegment.reply(1), MessageSegment.text("模型回复")]
-            ),
+            group_id=GROUP_ID, message=MessageSegment.text("模型回复")
         )
         handlers.chat_client.complete.assert_awaited_once()
     finally:
@@ -2101,6 +2134,8 @@ async def test_pending_draft_does_not_swallow_private_commands(app: App, runtime
             "聊天模型：deepseek-v4.1-flash\n"
             "聊天密钥：未配置\n"
             "Embedding 密钥：未配置\n"
+            "语音密钥：已配置（****）\n"
+            "语音音色：女声（stella）\n"
             "接口 ID：10023437\n"
             "接口密钥：已配置（****）",
             result=None,
@@ -2110,6 +2145,94 @@ async def test_pending_draft_does_not_swallow_private_commands(app: App, runtime
         ctx.should_finished(handlers.model_config_matcher)
 
     assert handlers._private_drafts[SUPERUSER_ID].group_id == GROUP_ID
+
+
+async def test_meme_switch_query_reports_disabled_state(app, runtime):
+    runtime.get_meme_enabled.return_value = False
+    event = make_group_event("/表情包开关", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, "当前群表情包：已关闭", result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.meme_switch_matcher)
+
+    runtime.get_meme_enabled.assert_awaited_once_with(GROUP_ID)
+    runtime.set_meme_enabled.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("value", "enabled", "reply"),
+    [
+        ("开", True, "已开启当前群表情包。"),
+        ("ON", True, "已开启当前群表情包。"),
+        ("关", False, "已关闭当前群表情包。"),
+        ("off", False, "已关闭当前群表情包。"),
+    ],
+)
+async def test_meme_switch_setting(app, runtime, value, enabled, reply):
+    event = make_group_event(f"/表情包开关 {value}", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, reply, result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.meme_switch_matcher)
+
+    runtime.set_meme_enabled.assert_awaited_once_with(GROUP_ID, enabled)
+
+
+async def test_meme_switch_cannot_enable_when_globally_disabled(
+    app, runtime, monkeypatch
+):
+    monkeypatch.setattr(handlers.config, "group_chat_memory_meme_enabled", False)
+    event = make_group_event("/表情包开关 开", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, handlers.MEME_GLOBALLY_DISABLED, result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.meme_switch_matcher)
+
+    runtime.set_meme_enabled.assert_not_awaited()
+
+
+async def test_meme_switch_rejects_unknown_value(app, runtime):
+    event = make_group_event("/表情包开关 可能吧", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, "开关参数只能是“开”或“关”。", result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.meme_switch_matcher)
+
+    runtime.set_meme_enabled.assert_not_awaited()
+
+
+async def test_superuser_reply_skips_meme_when_group_switch_is_off(
+    app, runtime, monkeypatch
+):
+    runtime.get_meme_enabled.return_value = False
+    coordinator = use_random(monkeypatch, 0.99)
+    event = make_group_event("超管说话", user_id=SUPERUSER_ID)
+
+    try:
+        async with app.test_matcher() as ctx:
+            bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+            ctx.should_call_api(
+                "send_group_msg",
+                {"group_id": GROUP_ID, "message": MessageSegment.text("模型回复")},
+                {"message_id": 123},
+            )
+            ctx.receive_event(bot, event)
+            await ctx.run()
+            await wait_until(lambda: runtime.record.await_count == 2)
+    finally:
+        await coordinator.close()
+
+    runtime.meme.fetch.assert_not_awaited()
 
 
 async def test_superuser_triggers_without_draw_and_attaches_meme(app, runtime, monkeypatch):
@@ -2354,3 +2477,369 @@ async def test_meme_credentials_reject_group_chat(app, runtime, monkeypatch):
         await ctx.run()
 
     setter.assert_not_awaited()
+
+
+async def test_voice_id_query_defaults_to_stella(app: App, runtime):
+    event = make_private_event(content="/设置语音音色", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, "当前语音音色：女声（stella）", result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.voice_id_matcher)
+
+
+@pytest.mark.parametrize(
+    ("argument", "voice_id", "label"),
+    [("tide", "tide", "男声（tide）"), ("女声", "stella", "女声（stella）")],
+)
+async def test_voice_id_setting_updates_runtime_config(
+    app: App, runtime, monkeypatch, argument, voice_id, label
+):
+    setter = AsyncMock()
+    monkeypatch.setattr(handlers.store, "set_runtime_config", setter)
+    event = make_private_event(
+        content=f"/设置语音音色 {argument}", user_id=SUPERUSER_ID
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, f"语音音色已设置为：{label}。", result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.voice_id_matcher)
+
+    setter.assert_awaited_once_with("tts_voice_id", voice_id)
+    assert handlers.config.group_chat_memory_tts_voice_id == voice_id
+
+
+async def test_voice_id_rejects_unknown_value(app: App, runtime, monkeypatch):
+    setter = AsyncMock()
+    monkeypatch.setattr(handlers.store, "set_runtime_config", setter)
+    event = make_private_event(content="/设置语音音色 abc", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, handlers.INVALID_VOICE_ID, result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.voice_id_matcher)
+
+    setter.assert_not_awaited()
+
+
+async def test_voice_id_rejects_group_chat(app: App, runtime, monkeypatch):
+    setter = AsyncMock()
+    monkeypatch.setattr(handlers.store, "set_runtime_config", setter)
+    event = make_group_event("/设置语音音色 tide", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, "请在私聊中设置语音音色。", result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.voice_id_matcher)
+
+    setter.assert_not_awaited()
+
+
+async def test_voice_id_requires_superuser(app: App, runtime, monkeypatch):
+    setter = AsyncMock()
+    monkeypatch.setattr(handlers.store, "set_runtime_config", setter)
+    event = make_private_event(content="/设置语音音色 tide", user_id=USER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, handlers.PERMISSION_DENIED, result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.voice_id_matcher)
+
+    setter.assert_not_awaited()
+
+
+async def test_voice_list_query_lists_members(app: App, runtime):
+    runtime.list_voice_member.return_value = [(1001, "小明"), (1002, "")]
+    event = make_group_event("/语音名单", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event,
+            "本群语音名单（2 人）：\n1001（小明）\n1002",
+            result=None,
+            bot=bot,
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.voice_list_matcher)
+
+    runtime.list_voice_member.assert_awaited_once_with(GROUP_ID)
+
+
+async def test_voice_list_add_skips_existing_members(app: App, runtime):
+    runtime.add_voice_member.side_effect = [True, False]
+    event = make_group_event("/语音名单 添加 1001 1002", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event,
+            "已加入语音名单：1 人，1 人原本已在名单中。",
+            result=None,
+            bot=bot,
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.voice_list_matcher)
+
+    assert [call.args for call in runtime.add_voice_member.await_args_list] == [
+        (GROUP_ID, 1001),
+        (GROUP_ID, 1002),
+    ]
+
+
+async def test_voice_list_requires_targets_for_add(app: App, runtime):
+    event = make_group_event("/语音名单 添加", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, handlers.VOICE_LIST_USAGE, result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.voice_list_matcher)
+
+    runtime.add_voice_member.assert_not_awaited()
+
+
+async def test_voice_list_clear_reports_removed_count(app: App, runtime):
+    runtime.clear_voice_member.return_value = 2
+    event = make_group_event("/语音名单 清空", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, "已清空本群语音名单（2 人）。", result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.voice_list_matcher)
+
+    runtime.clear_voice_member.assert_awaited_once_with(GROUP_ID)
+
+
+async def test_voice_list_requires_superuser(app: App, runtime):
+    event = make_group_event("/语音名单", user_id=USER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, handlers.PERMISSION_DENIED, result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.voice_list_matcher)
+
+    runtime.list_voice_member.assert_not_awaited()
+
+
+async def test_private_voice_list_flow_adds_member(app: App, runtime):
+    runtime.list_groups.return_value = [
+        (GROUP_ID, 12, "2023-11-14T22:13:20+00:00"),
+        (OTHER_GROUP_ID, 3, None),
+    ]
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        bot.get_group_list = AsyncMock(return_value=[])
+        command = make_private_event(content="/语音名单", user_id=SUPERUSER_ID)
+        ctx.should_call_send(
+            command,
+            "请选择要设置语音名单的群：\n"
+            f"1. {GROUP_ID}\n"
+            f"2. {OTHER_GROUP_ID}\n"
+            "回复序号或群号进行选择，回复“取消”退出。",
+            result=None,
+            bot=bot,
+        )
+        ctx.receive_event(bot, command)
+        await ctx.run()
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        choice = make_private_event(content="2", user_id=SUPERUSER_ID)
+        ctx.should_call_send(
+            choice,
+            handlers._member_prompt(OTHER_GROUP_ID, label="语音名单"),
+            result=None,
+            bot=bot,
+        )
+        ctx.receive_event(bot, choice)
+        ctx.should_finished(handlers.private_draft_matcher)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        answer = make_private_event(content="123456789", user_id=SUPERUSER_ID)
+        ctx.should_call_send(
+            answer,
+            f"已加入群 {OTHER_GROUP_ID} 的语音名单：1 人。",
+            result=None,
+            bot=bot,
+        )
+        ctx.receive_event(bot, answer)
+        ctx.should_finished(handlers.private_draft_matcher)
+
+    runtime.add_voice_member.assert_awaited_once_with(OTHER_GROUP_ID, 123456789)
+    assert handlers._private_drafts == {}
+
+
+async def test_voice_command_requires_configured_key(app: App, runtime):
+    handlers.config.group_chat_memory_tts_api_key = SecretStr("")
+    event = make_group_event("/语音", user_id=SUPERUSER_ID, reply=quoted_reply())
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, handlers.VOICE_NOT_CONFIGURED, result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.voice_matcher)
+
+    runtime.complete.assert_not_awaited()
+
+
+async def test_voice_command_requires_quoted_message(app: App, runtime):
+    event = make_group_event("/语音", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, handlers.VOICE_USAGE, result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.voice_matcher)
+
+    runtime.complete.assert_not_awaited()
+
+
+async def test_voice_command_sends_record_for_quoted_message(app: App, runtime):
+    runtime.complete.return_value = "语音内容"
+    event = make_group_event(
+        "/语音", user_id=SUPERUSER_ID, reply=quoted_reply("说点什么")
+    )
+    encoded = base64.b64encode(b"audio-bytes").decode()
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        send_group_msg = AsyncMock(return_value={"message_id": 123})
+        bot.send_group_msg = send_group_msg
+        ctx.receive_event(bot, event)
+        await ctx.run()
+
+    send_group_msg.assert_awaited_once_with(
+        group_id=GROUP_ID,
+        message=MessageSegment.record(f"base64://{encoded}"),
+    )
+    runtime.synthesize.assert_awaited_once_with("语音内容", voice_id="stella")
+    runtime.record.assert_awaited_once()
+    assert runtime.record.await_args.args[0].text == "语音内容"
+    assert runtime.record.await_args.args[0].is_bot is True
+
+
+async def test_voice_command_falls_back_to_text_when_tts_fails(app: App, runtime):
+    runtime.complete.return_value = "语音内容"
+    runtime.synthesize.side_effect = TTSError("boom")
+    event = make_group_event(
+        "/语音", user_id=SUPERUSER_ID, reply=quoted_reply("说点什么")
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        send_group_msg = AsyncMock(return_value={"message_id": 123})
+        bot.send_group_msg = send_group_msg
+        ctx.receive_event(bot, event)
+        await ctx.run()
+
+    send_group_msg.assert_awaited_once_with(
+        group_id=GROUP_ID, message=MessageSegment.text("语音内容")
+    )
+    runtime.record.assert_awaited_once()
+
+
+async def test_voice_command_reports_chat_failure(app: App, runtime):
+    runtime.complete.side_effect = ChatAPIError("sk-secret", status_code=500)
+    event = make_group_event(
+        "/语音", user_id=SUPERUSER_ID, reply=quoted_reply("说点什么")
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, handlers.GENERIC_REPLY_ERROR, result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.voice_matcher)
+
+    runtime.record.assert_not_awaited()
+
+
+async def test_voice_command_requires_superuser(app: App, runtime):
+    event = make_group_event("/语音", reply=quoted_reply())
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(event, handlers.PERMISSION_DENIED, result=None, bot=bot)
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.voice_matcher)
+
+    runtime.complete.assert_not_awaited()
+
+
+async def test_affection_leaderboard_first_member_gets_voice(
+    app: App, runtime, monkeypatch
+):
+    leaderboard = FakeLeaderboard(members={USER_ID}, top={USER_ID})
+    monkeypatch.setattr(handlers, "affection_leaderboard", leaderboard)
+    use_random(monkeypatch, 0.9)
+    event = make_group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text("你好")]),
+        to_me=True,
+    )
+    encoded = base64.b64encode(b"audio-bytes").decode()
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        send_group_msg = AsyncMock(return_value={"message_id": 123})
+        bot.send_group_msg = send_group_msg
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_until(lambda: runtime.record.await_count == 2)
+
+    send_group_msg.assert_awaited_once_with(
+        group_id=GROUP_ID,
+        message=MessageSegment.record(f"base64://{encoded}"),
+    )
+    runtime.synthesize.assert_awaited_once()
+    assert (GROUP_ID, USER_ID) in leaderboard.calls
+
+
+async def test_voice_send_failure_falls_back_to_text(
+    app: App, runtime, monkeypatch
+):
+    runtime.is_voice_member.return_value = True
+    use_random(monkeypatch, 0.9)
+    event = make_group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text("你好")]),
+        to_me=True,
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        send_group_msg = AsyncMock(
+            side_effect=[RuntimeError("record unsupported"), {"message_id": 123}]
+        )
+        bot.send_group_msg = send_group_msg
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_until(lambda: runtime.record.await_count == 2)
+
+    assert send_group_msg.await_count == 2
+    first, second = (call.kwargs["message"] for call in send_group_msg.await_args_list)
+    assert first.type == "record"
+    assert second == MessageSegment.text("模型回复")
+    assert runtime.record.await_args_list[-1].args[0].text == "模型回复"

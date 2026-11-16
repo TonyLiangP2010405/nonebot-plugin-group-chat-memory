@@ -90,18 +90,18 @@ class ReplyCoordinator:
             return True
         return self._random_value() < probability / 100.0
 
-    async def should_quote(self, group_id: int) -> bool:
-        """按当前群引用概率决定这条回复是否引用触发消息：0% 从不、100% 必定。
+    def choose_reply_mode(self, *, voice_available: bool) -> str:
+        """等概率选择回复形式：普通文字、引用文字、语音。
 
-        引用概率与随机回复概率相互独立，只决定回复的发送形式。概率每次从存储
-        读取，管理命令修改后立即生效；0 与 100 的边界不消耗随机值。
+        语音仅对榜一和语音名单成员开放；语音不可用时，语音那一份回退为普通
+        文字，因此普通和引用各占一半。每次回复只消耗一次随机值。
         """
-        probability = await self._store.get_quote_probability(group_id)
-        if probability <= 0.0:
-            return False
-        if probability >= 100.0:
-            return True
-        return self._random_value() < probability / 100.0
+        roll = self._random_value()
+        if roll < 1 / 3:
+            return "text"
+        if roll < 2 / 3:
+            return "quote"
+        return "voice" if voice_available else "text"
 
     def submit(self, group_id: int, message: Message, explicit: bool) -> None:
         """提交一条待回复消息；`explicit` 表示点名或回复触发的必须回复请求。"""

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -19,6 +20,7 @@ from nonebot_plugin_group_chat_memory.context import MEMORY_SECTION_TITLE, Conte
 from nonebot_plugin_group_chat_memory.memory import MemoryWriter
 from nonebot_plugin_group_chat_memory.replies import ReplyCoordinator
 from nonebot_plugin_group_chat_memory.store import MemoryStore
+from nonebot_plugin_group_chat_memory.tts import TTSClient
 
 BOT_ID = 10000
 GROUP_A = 20002
@@ -79,13 +81,14 @@ async def integrated_runtime(monkeypatch, tmp_path):
     store = MemoryStore(config)
     embedding = EmbeddingClient(config)
     writer = MemoryWriter(config, store, embedding, retry_delays=())
-    coordinator = ReplyCoordinator(store, handlers.reply)
+    coordinator = ReplyCoordinator(store, handlers.reply, random_value=lambda: 0.0)
     monkeypatch.setattr(handlers, "config", config)
     monkeypatch.setattr(handlers, "store", store)
     monkeypatch.setattr(handlers, "embedding_client", embedding)
     monkeypatch.setattr(handlers, "writer", writer)
     monkeypatch.setattr(handlers, "context_builder", ContextBuilder(config, store, embedding))
     monkeypatch.setattr(handlers, "chat_client", ChatClient(config, retry_delays=()))
+    monkeypatch.setattr(handlers, "tts_client", TTSClient(config, retry_delays=()))
     monkeypatch.setattr(handlers, "coordinator", coordinator)
     handlers._bots.clear()
     await store.open()
@@ -133,10 +136,7 @@ async def receive(
             await wait_for_message_count(runtime.store, event.group_id, stored_count)
         if reply is not None and runtime is not None:
             send_group_msg.assert_awaited_once_with(
-                group_id=event.group_id,
-                message=Message(
-                    [MessageSegment.reply(event.message_id), MessageSegment.text(reply)]
-                ),
+                group_id=event.group_id, message=MessageSegment.text(reply)
             )
 
 
@@ -287,3 +287,42 @@ async def test_probability_and_clear_commands_use_real_group_state(
     assert await integrated_runtime.store.get_probability(GROUP_A) == 100.0
     assert await integrated_runtime.store.get_probability(GROUP_B) == 22.2
     assert chat_route.call_count == 1
+
+
+@respx.mock
+async def test_voice_reply_sends_record_and_records_text(app: App, integrated_runtime):
+    respx.post("https://embedding.example/v1/embeddings").respond(
+        json=embedding_payload([[1.0, 0.0]])
+    )
+    respx.post("https://chat.example/v1/chat/completions").respond(
+        json=chat_payload("语音回复内容")
+    )
+    respx.post("https://api.deepseek.com/v1/tools/tts").respond(
+        200, content=b"wav-bytes", headers={"content-type": "audio/wav"}
+    )
+    await handlers.apply_setting("tts_api_key", "sk-tts")
+    await handlers.apply_setting("tts_voice_id", "stella")
+    await integrated_runtime.store.add_voice_member(GROUP_A, USER_ID)
+    handlers.coordinator._random_value = lambda: 0.9  # type: ignore[attr-defined]
+    event = group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text(" 用语音说 ")]),
+        to_me=True,
+        message_id=30,
+    )
+    encoded = base64.b64encode(b"wav-bytes").decode()
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        send_group_msg = AsyncMock(return_value={"message_id": 123})
+        bot.send_group_msg = send_group_msg
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_for_message_count(integrated_runtime.store, GROUP_A, 2)
+
+    send_group_msg.assert_awaited_once_with(
+        group_id=GROUP_A,
+        message=MessageSegment.record(f"base64://{encoded}"),
+    )
+    messages = await integrated_runtime.store.recent_messages(GROUP_A, 20)
+    assert messages[-1].text == "语音回复内容"
+    assert messages[-1].is_bot is True

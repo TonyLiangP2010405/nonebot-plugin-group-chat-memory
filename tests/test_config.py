@@ -29,7 +29,10 @@ class TestConfigDefaults:
         assert config.group_chat_memory_chunk_size == 10
         assert config.group_chat_memory_long_term_memories == 5
         assert config.group_chat_memory_default_probability == 0.0
-        assert config.group_chat_memory_default_quote_probability == 100.0
+        assert config.group_chat_memory_tts_api_key.get_secret_value() == ""
+        assert config.group_chat_memory_tts_voice_id == "stella"
+        assert config.group_chat_memory_tts_base_url == "https://api.deepseek.com/v1/tools/tts"
+        assert config.group_chat_memory_tts_timeout == 30.0
         assert config.group_chat_memory_hourly_request_limit == 10
         assert config.group_chat_memory_ignored_qq == set()
         assert config.group_chat_memory_db_path_override is None
@@ -121,17 +124,33 @@ class TestProbability:
             Config(group_chat_memory_default_probability=value)
 
 
-class TestQuoteProbability:
-    @pytest.mark.parametrize("value", [0, 0.0, 5.5, 100, 100.0])
-    def test_accepts_values_in_range(self, value):
-        config = Config(group_chat_memory_default_quote_probability=value)
+class TestTTSConfig:
+    def test_voice_defaults_to_female_stella(self):
+        config = Config()
 
-        assert config.group_chat_memory_default_quote_probability == value
+        assert config.group_chat_memory_tts_voice_id == "stella"
+        assert config.group_chat_memory_tts_base_url.endswith("/v1/tools/tts")
 
-    @pytest.mark.parametrize("value", [-0.1, 100.1, 101])
-    def test_rejects_values_outside_range(self, value):
+    def test_accepts_custom_voice_and_base_url(self):
+        config = Config(
+            group_chat_memory_tts_voice_id="tide",
+            group_chat_memory_tts_base_url="https://tts.example/v1/tools/tts",
+        )
+
+        assert config.group_chat_memory_tts_voice_id == "tide"
+        assert config.group_chat_memory_tts_base_url == "https://tts.example/v1/tools/tts"
+
+    @pytest.mark.parametrize("value", [0, -1, -0.5])
+    def test_rejects_non_positive_timeout(self, value):
         with pytest.raises(ValidationError):
-            Config(group_chat_memory_default_quote_probability=value)
+            Config(group_chat_memory_tts_timeout=value)
+
+    def test_tts_key_is_secret(self):
+        config = Config(group_chat_memory_tts_api_key="sk-tts-secret")
+
+        assert isinstance(config.group_chat_memory_tts_api_key, SecretStr)
+        assert config.group_chat_memory_tts_api_key.get_secret_value() == "sk-tts-secret"
+        assert "sk-tts-secret" not in repr(config)
 
 
 class TestAffectionBoost:

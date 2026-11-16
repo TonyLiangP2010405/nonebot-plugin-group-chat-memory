@@ -55,13 +55,22 @@ _SCHEMA_STATEMENTS = (
             CHECK (affection_probability >= 0 AND affection_probability <= 100),
         superuser_always_reply INTEGER NOT NULL DEFAULT 1
             CHECK (superuser_always_reply IN (0, 1)),
-        quote_probability REAL
-            CHECK (quote_probability >= 0 AND quote_probability <= 100),
+        meme_enabled INTEGER NOT NULL DEFAULT 1
+            CHECK (meme_enabled IN (0, 1)),
         updated_at TEXT NOT NULL
     )
     """,
     """
     CREATE TABLE IF NOT EXISTS always_reply_members (
+        group_id INTEGER NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL,
+        display_name TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (group_id, user_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS voice_members (
         group_id INTEGER NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE,
         user_id INTEGER NOT NULL,
         display_name TEXT NOT NULL DEFAULT '',
@@ -140,11 +149,11 @@ class MemoryStore:
         self._config = config
         self._dimensions = config.group_chat_memory_embedding_dimensions
         self._default_probability = config.group_chat_memory_default_probability
-        self._default_quote_probability = config.group_chat_memory_default_quote_probability
         self._default_hourly_limit = config.group_chat_memory_hourly_request_limit
         self._default_affection_enabled = DEFAULT_AFFECTION_ENABLED
         self._default_affection_probability = DEFAULT_AFFECTION_PROBABILITY
         self._default_superuser_always_reply = DEFAULT_SUPERUSER_ALWAYS_REPLY
+        self._default_meme_enabled = config.group_chat_memory_meme_enabled
         self._db: aiosqlite.Connection | None = None
         self._use_sqlite_vec = False
         self._lock = asyncio.Lock()
@@ -191,7 +200,7 @@ class MemoryStore:
                     await self._ensure_groups_hourly_limit(tx)
                     await self._ensure_groups_affection_settings(tx)
                     await self._ensure_groups_superuser_reply(tx)
-                    await self._ensure_groups_quote_probability(tx)
+                    await self._ensure_groups_meme_enabled(tx)
                     await self._ensure_dimensions(tx)
                     if use_sqlite_vec:
                         await tx.execute(
@@ -286,39 +295,6 @@ class MemoryStore:
                 "ON CONFLICT(group_id) DO UPDATE SET "
                 "probability = excluded.probability, updated_at = excluded.updated_at",
                 (group_id, probability, _format_timestamp(_utc_now())),
-            )
-
-    async def get_quote_probability(self, group_id: int) -> float:
-        """返回当前群引用回复的概率；未单独设置时使用插件默认值。"""
-        async with self._lock:
-            db = self._require_db()
-            cursor = await db.execute(
-                "SELECT quote_probability FROM groups WHERE group_id = ?", (group_id,)
-            )
-            row = await cursor.fetchone()
-            await cursor.close()
-        if row is None or row["quote_probability"] is None:
-            return self._default_quote_probability
-        return float(row["quote_probability"])
-
-    async def set_quote_probability(self, group_id: int, value: float) -> None:
-        """设置当前群引用回复的概率，取值必须在 0 到 100 之间。"""
-        probability = float(value)
-        if not math.isfinite(probability) or not 0.0 <= probability <= 100.0:
-            raise ValueError("引用回复概率必须是 0 到 100 之间的数值。")
-        async with self._transaction() as db:
-            await db.execute(
-                "INSERT INTO groups"
-                "(group_id, probability, quote_probability, updated_at) "
-                "VALUES (?, ?, ?, ?) ON CONFLICT(group_id) DO UPDATE SET "
-                "quote_probability = excluded.quote_probability, "
-                "updated_at = excluded.updated_at",
-                (
-                    group_id,
-                    self._default_probability,
-                    probability,
-                    _format_timestamp(_utc_now()),
-                ),
             )
 
     async def get_hourly_limit(self, group_id: int) -> int:
@@ -449,6 +425,37 @@ class MemoryStore:
                 ),
             )
 
+    async def get_meme_enabled(self, group_id: int) -> bool:
+        """返回当前群是否在回复后追加表情包。"""
+        async with self._lock:
+            db = self._require_db()
+            cursor = await db.execute(
+                "SELECT meme_enabled FROM groups WHERE group_id = ?", (group_id,)
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        if row is None:
+            return self._default_meme_enabled
+        return bool(row["meme_enabled"])
+
+    async def set_meme_enabled(self, group_id: int, enabled: bool) -> None:
+        """启用或关闭当前群回复后的表情包。"""
+        async with self._transaction() as db:
+            await db.execute(
+                "INSERT INTO groups"
+                "(group_id, probability, hourly_limit, meme_enabled, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(group_id) DO UPDATE SET "
+                "meme_enabled = excluded.meme_enabled, "
+                "updated_at = excluded.updated_at",
+                (
+                    group_id,
+                    self._default_probability,
+                    self._default_hourly_limit,
+                    int(enabled),
+                    _format_timestamp(_utc_now()),
+                ),
+            )
+
     async def is_always_reply(self, group_id: int, user_id: int) -> bool:
         """返回成员是否在当前群的必回名单中。"""
         async with self._lock:
@@ -514,6 +521,78 @@ class MemoryStore:
                 "ORDER BY m.id DESC LIMIT 1"
                 "), a.display_name, '') AS display_name "
                 "FROM always_reply_members AS a "
+                "WHERE a.group_id = ? ORDER BY a.created_at, a.user_id",
+                (group_id,),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [(int(row["user_id"]), str(row["display_name"])) for row in rows]
+
+    async def is_voice_member(self, group_id: int, user_id: int) -> bool:
+        """返回成员是否在当前群的语音名单中。"""
+        async with self._lock:
+            db = self._require_db()
+            cursor = await db.execute(
+                "SELECT 1 FROM voice_members WHERE group_id = ? AND user_id = ?",
+                (group_id, user_id),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        return row is not None
+
+    async def add_voice_member(
+        self, group_id: int, user_id: int, display_name: str = ""
+    ) -> bool:
+        """把成员加入语音名单；返回是否为新增（已存在时只更新缓存的群名片）。"""
+        async with self._transaction() as db:
+            await self._ensure_group(db, group_id)
+            cursor = await db.execute(
+                "SELECT 1 FROM voice_members WHERE group_id = ? AND user_id = ?",
+                (group_id, user_id),
+            )
+            existed = await cursor.fetchone() is not None
+            await cursor.close()
+            await db.execute(
+                "INSERT INTO voice_members"
+                "(group_id, user_id, display_name, created_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(group_id, user_id) DO UPDATE SET "
+                "display_name = excluded.display_name",
+                (group_id, user_id, display_name, _format_timestamp(_utc_now())),
+            )
+        return not existed
+
+    async def remove_voice_member(self, group_id: int, user_id: int) -> bool:
+        """把成员移出语音名单，返回是否真的删除了记录。"""
+        async with self._transaction() as db:
+            cursor = await db.execute(
+                "DELETE FROM voice_members WHERE group_id = ? AND user_id = ?",
+                (group_id, user_id),
+            )
+            removed = cursor.rowcount > 0
+            await cursor.close()
+        return removed
+
+    async def clear_voice_member(self, group_id: int) -> int:
+        """清空当前群的语音名单，返回删除的人数。"""
+        async with self._transaction() as db:
+            cursor = await db.execute(
+                "DELETE FROM voice_members WHERE group_id = ?", (group_id,)
+            )
+            removed = cursor.rowcount
+            await cursor.close()
+        return max(int(removed or 0), 0)
+
+    async def list_voice_member(self, group_id: int) -> list[tuple[int, str]]:
+        """返回当前群语音名单的 (QQ, 群名片)，群名片优先取最近一条消息。"""
+        async with self._lock:
+            db = self._require_db()
+            cursor = await db.execute(
+                "SELECT a.user_id, COALESCE(("
+                "SELECT m.display_name FROM messages AS m "
+                "WHERE m.group_id = a.group_id AND m.user_id = a.user_id "
+                "ORDER BY m.id DESC LIMIT 1"
+                "), a.display_name, '') AS display_name "
+                "FROM voice_members AS a "
                 "WHERE a.group_id = ? ORDER BY a.created_at, a.user_id",
                 (group_id,),
             )
@@ -749,7 +828,7 @@ class MemoryStore:
         return [_row_to_chunk(row) for _, _, row in scored[:limit]]
 
     async def clear_group(self, group_id: int) -> None:
-        """删除当前群的消息、片段、向量和请求计数，保留概率、引用概率与每小时上限。"""
+        """删除当前群的消息、片段、向量和请求计数，保留概率与每小时上限等群设置。"""
         async with self._transaction() as db:
             await db.execute(
                 "DELETE FROM memory_vector_blobs WHERE group_id = ?", (group_id,)
@@ -832,14 +911,14 @@ class MemoryStore:
                 f"DEFAULT {int(self._default_superuser_always_reply)}"
             )
 
-    async def _ensure_groups_quote_probability(self, db: aiosqlite.Connection) -> None:
+    async def _ensure_groups_meme_enabled(self, db: aiosqlite.Connection) -> None:
         cursor = await db.execute("PRAGMA table_info(groups)")
         rows = await cursor.fetchall()
         await cursor.close()
-        if not any(row["name"] == "quote_probability" for row in rows):
+        if not any(row["name"] == "meme_enabled" for row in rows):
             await db.execute(
-                "ALTER TABLE groups ADD COLUMN quote_probability REAL "
-                "CHECK (quote_probability >= 0 AND quote_probability <= 100)"
+                "ALTER TABLE groups ADD COLUMN meme_enabled INTEGER NOT NULL "
+                f"DEFAULT {int(self._default_meme_enabled)}"
             )
 
     async def _ensure_dimensions(self, db: aiosqlite.Connection) -> None:

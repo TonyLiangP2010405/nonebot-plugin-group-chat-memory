@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import re
 import time
@@ -26,28 +27,51 @@ from nonebot.permission import SUPERUSER
 
 from .affection import AffectionLeaderboard
 from .api import ChatAPIError, ChatClient, EmbeddingClient
-from .config import get_settings
+from .config import (
+    DEFAULT_TTS_VOICE_ID,
+    TTS_VOICES,
+    get_settings,
+)
 from .context import ContextBuilder
 from .meme import MemeProvider
 from .memory import MemoryWriter
 from .models import Message as MemoryMessage
 from .replies import ReplyCoordinator
 from .store import MemoryStore
+from .tts import TTSClient
 
 logger = logging.getLogger(__name__)
 
 GENERIC_REPLY_ERROR = "暂时无法生成回复，请稍后再试。"
 PERMISSION_DENIED = "仅 SUPERUSER 可执行此命令。"
 INVALID_PROBABILITY = "概率需为 0～100 的数字，最多一位小数。"
-INVALID_QUOTE_PROBABILITY = "引用概率需为 0～100 的数字，最多一位小数。"
 INVALID_HOURLY_LIMIT = "每小时请求上限必须是 1 到 10000 的整数。"
 INVALID_AFFECTION_PROBABILITY = "好感榜触发概率需为 0～100 的数字，最多一位小数。"
 INVALID_AFFECTION_SWITCH = "开关参数只能是“开”或“关”。"
 INVALID_SUPERUSER_REPLY_SWITCH = "开关参数只能是“开”或“关”。"
+INVALID_MEME_SWITCH = "开关参数只能是“开”或“关”。"
+MEME_GLOBALLY_DISABLED = (
+    "全局表情包已被 GROUP_CHAT_MEMORY_MEME_ENABLED=false 关闭，先在 .env 中打开。"
+)
 ALWAYS_REPLY_USAGE = (
     "用法：/必回名单｜/必回名单 添加 @群友 123456｜"
     "/必回名单 删除 @群友｜/必回名单 清空"
 )
+VOICE_LIST_USAGE = (
+    "用法：/语音名单｜/语音名单 添加 @群友 123456｜"
+    "/语音名单 删除 @群友｜/语音名单 清空"
+)
+VOICE_USAGE = "请引用一条文字消息，再发送 /语音。"
+VOICE_NOT_CONFIGURED = "语音合成未配置，请 SUPERUSER 私聊发送 /设置语音密钥。"
+INVALID_VOICE_ID = "语音音色只能是 stella（女声）或 tide（男声）。"
+VOICE_ALIASES = {
+    "stella": "stella",
+    "女声": "stella",
+    "女": "stella",
+    "tide": "tide",
+    "男声": "tide",
+    "男": "tide",
+}
 ALWAYS_REPLY_ADD = {"添加", "加", "add"}
 ALWAYS_REPLY_REMOVE = {"删除", "移除", "删", "remove", "del"}
 ALWAYS_REPLY_CLEAR = {"清空", "clear"}
@@ -56,12 +80,15 @@ QQ_PATTERN = re.compile(r"\d{5,12}")
 PRIVATE_DRAFT_TTL = 300.0
 PRIVATE_GROUP_CHOICE_LIMIT = 50
 CANCEL_NOTICE = "已取消必回名单操作。"
+VOICE_CANCEL_NOTICE = "已取消语音名单操作。"
 NO_KNOWN_GROUP = "还没有任何群的聊天记录，先在群里用一次机器人再试。"
 AFFECTION_SWITCH_ON = {"开", "开启", "on", "1", "true"}
 AFFECTION_SWITCH_OFF = {"关", "关闭", "off", "0", "false"}
 RATE_LIMIT_NOTICE = "本群本小时请求次数已用完，请稍后再来。"
 PROBABILITY_PATTERN = re.compile(r"(?:100(?:\.0)?|\d{1,2}(?:\.\d)?)")
-SECRET_COMMAND_LOG_PATTERN = re.compile(r"(设置聊天密钥|设置向量密钥)\s+[^\r\n]*")
+SECRET_COMMAND_LOG_PATTERN = re.compile(
+    r"(设置聊天密钥|设置向量密钥|设置语音密钥)\s+[^\r\n]*"
+)
 
 
 def _redact_secret_command_logs(record) -> None:
@@ -76,6 +103,7 @@ embedding_client = EmbeddingClient(config)
 writer = MemoryWriter(config, store, embedding_client)
 context_builder = ContextBuilder(config, store, embedding_client)
 chat_client = ChatClient(config)
+tts_client = TTSClient(config)
 meme_provider: MemeProvider
 
 
@@ -116,18 +144,49 @@ async def shutdown() -> None:
             await store.close()
 
 
-async def _outgoing_text(
-    group_id: int, text: str, message_id: int | None
-) -> Message | MessageSegment:
-    """按当前群引用概率构造回复：命中且知道触发消息时附带引用。"""
-    if message_id is not None and await coordinator.should_quote(group_id):
-        return Message([MessageSegment.reply(message_id), MessageSegment.text(text)])
-    return MessageSegment.text(text)
+def _record_segment(audio: bytes) -> MessageSegment:
+    """把 WAV 音频编码成 OneBot 语音消息段。"""
+    encoded = base64.b64encode(audio).decode()
+    return MessageSegment.record(f"base64://{encoded}")
+
+
+def _voice_label(voice_id: str) -> str:
+    return TTS_VOICES.get(voice_id.strip().lower(), TTS_VOICES[DEFAULT_TTS_VOICE_ID])
+
+
+async def _record_bot_reply(bot: Bot, group_id: int, text: str) -> None:
+    await writer.record(
+        MemoryMessage(
+            group_id=group_id,
+            user_id=int(bot.self_id),
+            display_name="Bot",
+            text=text,
+            is_bot=True,
+        )
+    )
+
+
+async def _voice_available(group_id: int, user_id: int) -> bool:
+    """语音只对榜一和语音名单成员开放；未配置语音密钥时视为不可用。"""
+    if not config.group_chat_memory_tts_api_key.get_secret_value().strip():
+        return False
+    if await store.is_voice_member(group_id, user_id):
+        return True
+    return await affection_leaderboard.is_top_member(group_id, user_id, limit=1)
+
+
+async def _synthesize(text: str) -> bytes | None:
+    try:
+        return await tts_client.synthesize(
+            text, voice_id=config.group_chat_memory_tts_voice_id
+        )
+    except Exception as exc:
+        logger.warning("语音合成失败：%s", type(exc).__name__)
+        return None
 
 
 async def reply(group_id: int, message: MemoryMessage) -> None:
     bot = _bots[group_id]
-    message_id = message.message_id
     try:
         context = await context_builder.build(group_id, message.text)
         response = await chat_client.complete(
@@ -137,29 +196,44 @@ async def reply(group_id: int, message: MemoryMessage) -> None:
         status = f" HTTP {exc.status_code}" if isinstance(exc, ChatAPIError) else ""
         logger.error("群 %s 的聊天回复失败：%s%s", group_id, type(exc).__name__, status)
         await bot.send_group_msg(
-            group_id=group_id,
-            message=await _outgoing_text(group_id, GENERIC_REPLY_ERROR, message_id),
+            group_id=group_id, message=MessageSegment.text(GENERIC_REPLY_ERROR)
         )
         return
 
-    outgoing = await _outgoing_text(group_id, response, message_id)
+    mode = coordinator.choose_reply_mode(
+        voice_available=await _voice_available(group_id, message.user_id)
+    )
+    if mode == "voice":
+        audio = await _synthesize(response)
+        if audio is not None:
+            try:
+                await bot.send_group_msg(
+                    group_id=group_id, message=_record_segment(audio)
+                )
+            except Exception as exc:
+                logger.warning(
+                    "群 %s 的语音发送失败：%s", group_id, type(exc).__name__
+                )
+            else:
+                await _record_bot_reply(bot, group_id, response)
+                return
+        mode = "text"
+
+    if mode == "quote" and message.message_id is not None:
+        outgoing: Message | MessageSegment = Message(
+            [MessageSegment.reply(message.message_id), MessageSegment.text(response)]
+        )
+    else:
+        outgoing = MessageSegment.text(response)
     await bot.send_group_msg(group_id=group_id, message=outgoing)
-    if message.attach_meme:
+    if message.attach_meme and await store.get_meme_enabled(group_id):
         try:
             image_url = await meme_provider.fetch(response)
             if image_url:
                 await bot.send_group_msg(group_id=group_id, message=MessageSegment.image(image_url))
         except Exception as exc:
             logger.warning("群 %s 的表情包发送失败：%s", group_id, type(exc).__name__)
-    await writer.record(
-        MemoryMessage(
-            group_id=group_id,
-            user_id=int(bot.self_id),
-            display_name="Bot",
-            text=response,
-            is_bot=True,
-        )
-    )
+    await _record_bot_reply(bot, group_id, response)
 
 
 coordinator = ReplyCoordinator(store, reply)
@@ -184,6 +258,7 @@ class _PrivateDraft:
     expires_at: float
     groups: tuple[int, ...] = ()
     group_id: int | None = None
+    kind: str = "always_reply"
 
 
 _private_drafts: dict[int, _PrivateDraft] = {}
@@ -226,8 +301,10 @@ async def _group_names(bot: Bot) -> dict[int, str]:
     return names
 
 
-def _group_choice_list(group_ids: tuple[int, ...], names: dict[int, str]) -> str:
-    lines = ["请选择要设置必回名单的群："]
+def _group_choice_list(
+    group_ids: tuple[int, ...], names: dict[int, str], *, label: str = "必回名单"
+) -> str:
+    lines = [f"请选择要设置{label}的群："]
     for index, group_id in enumerate(group_ids, start=1):
         name = names.get(group_id)
         lines.append(
@@ -237,10 +314,10 @@ def _group_choice_list(group_ids: tuple[int, ...], names: dict[int, str]) -> str
     return "\n".join(lines)
 
 
-def _member_prompt(group_id: int) -> str:
+def _member_prompt(group_id: int, *, label: str = "必回名单") -> str:
     return (
         f"已选择群 {group_id}。\n"
-        "请发送要加入必回名单的 QQ 号，多个用空格、逗号或换行分隔，回复“取消”退出。"
+        f"请发送要加入{label}的 QQ 号，多个用空格、逗号或换行分隔，回复“取消”退出。"
     )
 
 
@@ -273,6 +350,8 @@ async def apply_setting(key: str, value: str) -> None:
             "chat_api_key": config.group_chat_memory_chat_api_key.get_secret_value(),
             "chat_model": config.group_chat_memory_chat_model,
             "embedding_api_key": config.group_chat_memory_embedding_api_key.get_secret_value(),
+            "tts_api_key": config.group_chat_memory_tts_api_key.get_secret_value(),
+            "tts_voice_id": config.group_chat_memory_tts_voice_id,
             "apihz_id": config.group_chat_memory_apihz_id,
             "apihz_key": config.group_chat_memory_apihz_key.get_secret_value(),
         }
@@ -287,6 +366,8 @@ chat_url_matcher = on_command("设置聊天地址", priority=-1001, block=True)
 chat_key_matcher = on_command("设置聊天密钥", priority=-1001, block=True)
 chat_model_matcher = on_command("设置聊天模型", priority=-1001, block=True)
 embedding_key_matcher = on_command("设置向量密钥", priority=-1001, block=True)
+voice_key_matcher = on_command("设置语音密钥", priority=-1001, block=True)
+voice_id_matcher = on_command("设置语音音色", priority=-1001, block=True)
 meme_id_matcher = on_command("设置表情包ID", priority=-1001, block=True)
 meme_key_matcher = on_command("设置表情包密钥", priority=-1001, block=True)
 model_config_matcher = on_command("模型配置", priority=-1001, block=True)
@@ -357,6 +438,40 @@ async def handle_embedding_key(
     await _handle_setting(embedding_key_matcher, bot, event, args, "embedding_api_key")
 
 
+@voice_key_matcher.handle()
+async def handle_voice_key(
+    bot: Bot, event: MessageEvent, args: Annotated[Message, CommandArg()]
+) -> None:
+    await _handle_setting(voice_key_matcher, bot, event, args, "tts_api_key")
+
+
+@voice_id_matcher.handle()
+async def handle_voice_id(
+    bot: Bot,
+    event: MessageEvent,
+    args: Annotated[Message, CommandArg()],
+) -> None:
+    if not isinstance(event, PrivateMessageEvent):
+        await voice_id_matcher.finish("请在私聊中设置语音音色。")
+    if not await SUPERUSER(bot, event):
+        await voice_id_matcher.finish(PERMISSION_DENIED)
+
+    text = args.extract_plain_text().strip().lower()
+    if not text:
+        await voice_id_matcher.finish(
+            f"当前语音音色：{_voice_label(config.group_chat_memory_tts_voice_id)}"
+        )
+    voice_id = VOICE_ALIASES.get(text)
+    if voice_id is None:
+        await voice_id_matcher.finish(INVALID_VOICE_ID)
+    try:
+        await apply_setting("tts_voice_id", voice_id)
+    except Exception as exc:
+        logger.error("保存语音音色失败：%s", type(exc).__name__)
+        await voice_id_matcher.finish("配置保存失败，请稍后再试。")
+    await voice_id_matcher.finish(f"语音音色已设置为：{_voice_label(voice_id)}。")
+
+
 @meme_id_matcher.handle()
 async def handle_meme_id(
     bot: Bot, event: MessageEvent, args: Annotated[Message, CommandArg()]
@@ -385,6 +500,8 @@ async def handle_model_config(bot: Bot, event: MessageEvent) -> None:
         f"聊天密钥：{status(config.group_chat_memory_chat_api_key.get_secret_value())}\n"
         "Embedding 密钥："
         f"{status(config.group_chat_memory_embedding_api_key.get_secret_value())}\n"
+        f"语音密钥：{status(config.group_chat_memory_tts_api_key.get_secret_value())}\n"
+        f"语音音色：{_voice_label(config.group_chat_memory_tts_voice_id)}\n"
         f"接口 ID：{config.group_chat_memory_apihz_id or '未配置'}\n"
         f"接口密钥：{status(config.group_chat_memory_apihz_key.get_secret_value())}"
     )
@@ -392,9 +509,6 @@ async def handle_model_config(bot: Bot, event: MessageEvent) -> None:
 
 probability_matcher = on_command(
     "回复概率", rule=_eligible_group_message, priority=-1001, block=True
-)
-quote_probability_matcher = on_command(
-    "引用概率", rule=_eligible_group_message, priority=-1001, block=True
 )
 clear_matcher = on_command(
     "清空群记忆", rule=_eligible_group_message, priority=-1001, block=True
@@ -408,14 +522,26 @@ affection_probability_matcher = on_command(
 affection_switch_matcher = on_command(
     "好感开关", rule=_eligible_group_message, priority=-1001, block=True
 )
+meme_switch_matcher = on_command(
+    "表情包开关", rule=_eligible_group_message, priority=-1001, block=True
+)
 superuser_reply_matcher = on_command(
     "超管必回", rule=_eligible_group_message, priority=-1001, block=True
 )
 always_reply_matcher = on_command(
     "必回名单", rule=_eligible_group_message, priority=-1001, block=True
 )
+voice_list_matcher = on_command(
+    "语音名单", rule=_eligible_group_message, priority=-1001, block=True
+)
+voice_matcher = on_command(
+    "语音", rule=_eligible_group_message, priority=-1001, block=True
+)
 private_always_reply_matcher = on_command(
     "必回名单", rule=_private_message, priority=-1001, block=True
+)
+private_voice_list_matcher = on_command(
+    "语音名单", rule=_private_message, priority=-1001, block=True
 )
 private_draft_matcher = on_message(
     rule=_pending_private_draft, priority=-1001, block=True
@@ -442,27 +568,6 @@ async def handle_probability(
     probability = float(text)
     await store.set_probability(event.group_id, probability)
     await probability_matcher.finish(f"已设置当前群随机回复概率：{probability:.1f}%")
-
-
-@quote_probability_matcher.handle()
-async def handle_quote_probability(
-    bot: Bot,
-    event: GroupMessageEvent,
-    args: Annotated[Message, CommandArg()],
-) -> None:
-    if not await SUPERUSER(bot, event):
-        await quote_probability_matcher.finish(PERMISSION_DENIED)
-
-    text = args.extract_plain_text().strip()
-    if not text:
-        probability = await store.get_quote_probability(event.group_id)
-        await quote_probability_matcher.finish(f"当前群引用回复概率：{probability:.1f}%")
-    if PROBABILITY_PATTERN.fullmatch(text) is None:
-        await quote_probability_matcher.finish(INVALID_QUOTE_PROBABILITY)
-
-    probability = float(text)
-    await store.set_quote_probability(event.group_id, probability)
-    await quote_probability_matcher.finish(f"已设置当前群引用回复概率：{probability:.1f}%")
 
 
 @clear_matcher.handle()
@@ -567,7 +672,33 @@ async def handle_superuser_reply_switch(
     await superuser_reply_matcher.finish(INVALID_SUPERUSER_REPLY_SWITCH)
 
 
-def _always_reply_targets(args: Message) -> list[int]:
+@meme_switch_matcher.handle()
+async def handle_meme_switch(
+    bot: Bot,
+    event: GroupMessageEvent,
+    args: Annotated[Message, CommandArg()],
+) -> None:
+    if not await SUPERUSER(bot, event):
+        await meme_switch_matcher.finish(PERMISSION_DENIED)
+
+    text = args.extract_plain_text().strip().lower()
+    if not text:
+        enabled = await store.get_meme_enabled(event.group_id)
+        await meme_switch_matcher.finish(
+            f"当前群表情包：{'已开启' if enabled else '已关闭'}"
+        )
+    if text in AFFECTION_SWITCH_ON:
+        if not config.group_chat_memory_meme_enabled:
+            await meme_switch_matcher.finish(MEME_GLOBALLY_DISABLED)
+        await store.set_meme_enabled(event.group_id, True)
+        await meme_switch_matcher.finish("已开启当前群表情包。")
+    if text in AFFECTION_SWITCH_OFF:
+        await store.set_meme_enabled(event.group_id, False)
+        await meme_switch_matcher.finish("已关闭当前群表情包。")
+    await meme_switch_matcher.finish(INVALID_MEME_SWITCH)
+
+
+def _target_user_ids(args: Message) -> list[int]:
     """从命令参数中提取目标 QQ：支持 @ 群友和直接写号码。"""
     targets: list[int] = []
     for segment in args:
@@ -582,6 +713,72 @@ def _always_reply_targets(args: Message) -> list[int]:
     return targets
 
 
+async def _handle_member_list(
+    matcher, event: GroupMessageEvent, args: Message, *, kind: str
+) -> None:
+    if kind == "voice":
+        label = "语音名单"
+        usage = VOICE_LIST_USAGE
+        list_members = store.list_voice_member
+        add_member = store.add_voice_member
+        remove_member = store.remove_voice_member
+        clear_members = store.clear_voice_member
+    else:
+        label = "必回名单"
+        usage = ALWAYS_REPLY_USAGE
+        list_members = store.list_always_reply
+        add_member = store.add_always_reply
+        remove_member = store.remove_always_reply
+        clear_members = store.clear_always_reply
+
+    parts = args.extract_plain_text().strip().split()
+    action = parts[0] if parts else ""
+    if not action:
+        members = await list_members(event.group_id)
+        if not members:
+            await matcher.finish(f"本群{label}为空。")
+        lines = [f"本群{label}（{len(members)} 人）："]
+        lines.extend(
+            f"{user_id}（{name}）" if name else str(user_id) for user_id, name in members
+        )
+        await matcher.finish("\n".join(lines))
+
+    targets = _target_user_ids(args)
+    if action in ALWAYS_REPLY_CLEAR:
+        removed = await clear_members(event.group_id)
+        if removed == 0:
+            await matcher.finish(f"本群{label}本来就是空的。")
+        await matcher.finish(f"已清空本群{label}（{removed} 人）。")
+
+    if action in ALWAYS_REPLY_ADD:
+        if not targets:
+            await matcher.finish(usage)
+        added = 0
+        for user_id in targets:
+            if await add_member(event.group_id, user_id):
+                added += 1
+        skipped = len(targets) - added
+        if added == 0:
+            await matcher.finish(f"这些群友已经在{label}里了。")
+        suffix = f"，{skipped} 人原本已在名单中" if skipped else ""
+        await matcher.finish(f"已加入{label}：{added} 人{suffix}。")
+
+    if action in ALWAYS_REPLY_REMOVE:
+        if not targets:
+            await matcher.finish(usage)
+        removed = 0
+        for user_id in targets:
+            if await remove_member(event.group_id, user_id):
+                removed += 1
+        if removed == 0:
+            await matcher.finish(f"这些群友本来就不在{label}里。")
+        skipped = len(targets) - removed
+        suffix = f"，{skipped} 人原本就不在名单中" if skipped else ""
+        await matcher.finish(f"已移出{label}：{removed} 人{suffix}。")
+
+    await matcher.finish(usage)
+
+
 @always_reply_matcher.handle()
 async def handle_always_reply(
     bot: Bot,
@@ -590,72 +787,89 @@ async def handle_always_reply(
 ) -> None:
     if not await SUPERUSER(bot, event):
         await always_reply_matcher.finish(PERMISSION_DENIED)
-
-    parts = args.extract_plain_text().strip().split()
-    action = parts[0] if parts else ""
-    if not action:
-        members = await store.list_always_reply(event.group_id)
-        if not members:
-            await always_reply_matcher.finish("本群必回名单为空。")
-        lines = [f"本群必回名单（{len(members)} 人）："]
-        lines.extend(
-            f"{user_id}（{name}）" if name else str(user_id) for user_id, name in members
-        )
-        await always_reply_matcher.finish("\n".join(lines))
-
-    targets = _always_reply_targets(args)
-    if action in ALWAYS_REPLY_CLEAR:
-        removed = await store.clear_always_reply(event.group_id)
-        if removed == 0:
-            await always_reply_matcher.finish("本群必回名单本来就是空的。")
-        await always_reply_matcher.finish(f"已清空本群必回名单（{removed} 人）。")
-
-    if action in ALWAYS_REPLY_ADD:
-        if not targets:
-            await always_reply_matcher.finish(ALWAYS_REPLY_USAGE)
-        added = 0
-        for user_id in targets:
-            if await store.add_always_reply(event.group_id, user_id):
-                added += 1
-        skipped = len(targets) - added
-        if added == 0:
-            await always_reply_matcher.finish("这些群友已经在必回名单里了。")
-        suffix = f"，{skipped} 人原本已在名单中" if skipped else ""
-        await always_reply_matcher.finish(f"已加入必回名单：{added} 人{suffix}。")
-
-    if action in ALWAYS_REPLY_REMOVE:
-        if not targets:
-            await always_reply_matcher.finish(ALWAYS_REPLY_USAGE)
-        removed = 0
-        for user_id in targets:
-            if await store.remove_always_reply(event.group_id, user_id):
-                removed += 1
-        if removed == 0:
-            await always_reply_matcher.finish("这些群友本来就不在必回名单里。")
-        skipped = len(targets) - removed
-        suffix = f"，{skipped} 人原本就不在名单中" if skipped else ""
-        await always_reply_matcher.finish(f"已移出必回名单：{removed} 人{suffix}。")
-
-    await always_reply_matcher.finish(ALWAYS_REPLY_USAGE)
+    await _handle_member_list(always_reply_matcher, event, args, kind="always_reply")
 
 
-@private_always_reply_matcher.handle()
-async def handle_private_always_reply(
+@voice_list_matcher.handle()
+async def handle_voice_list(
     bot: Bot,
-    event: PrivateMessageEvent,
+    event: GroupMessageEvent,
     args: Annotated[Message, CommandArg()],
 ) -> None:
     if not await SUPERUSER(bot, event):
-        await private_always_reply_matcher.finish(PERMISSION_DENIED)
+        await voice_list_matcher.finish(PERMISSION_DENIED)
+    await _handle_member_list(voice_list_matcher, event, args, kind="voice")
+
+
+@voice_matcher.handle()
+async def handle_voice(bot: Bot, event: GroupMessageEvent) -> None:
+    if not await SUPERUSER(bot, event):
+        await voice_matcher.finish(PERMISSION_DENIED)
+    if not config.group_chat_memory_tts_api_key.get_secret_value().strip():
+        await voice_matcher.finish(VOICE_NOT_CONFIGURED)
+    if event.reply is None:
+        await voice_matcher.finish(VOICE_USAGE)
+
+    source = event.reply.message.extract_plain_text().strip()
+    if not source:
+        await voice_matcher.finish("被引用的消息里没有可朗读的文字。")
+
+    _bots[event.group_id] = bot
+    try:
+        context = await context_builder.build(event.group_id, source)
+        response = await chat_client.complete(
+            context, source, session_id=f"group:{event.group_id}"
+        )
+    except Exception as exc:
+        status = f" HTTP {exc.status_code}" if isinstance(exc, ChatAPIError) else ""
+        logger.error("群 %s 的语音回复生成失败：%s%s", event.group_id, type(exc).__name__, status)
+        await voice_matcher.finish(GENERIC_REPLY_ERROR)
+
+    audio = await _synthesize(response)
+    if audio is not None:
+        try:
+            await bot.send_group_msg(
+                group_id=event.group_id, message=_record_segment(audio)
+            )
+        except Exception as exc:
+            logger.warning(
+                "群 %s 的语音发送失败：%s", event.group_id, type(exc).__name__
+            )
+            audio = None
+    if audio is None:
+        await bot.send_group_msg(
+            group_id=event.group_id, message=MessageSegment.text(response)
+        )
+    await _record_bot_reply(bot, event.group_id, response)
+
+
+def _draft_label(kind: str) -> str:
+    return "语音名单" if kind == "voice" else "必回名单"
+
+
+def _draft_cancel_notice(kind: str) -> str:
+    return VOICE_CANCEL_NOTICE if kind == "voice" else CANCEL_NOTICE
+
+
+async def _start_private_member_draft(
+    matcher,
+    bot: Bot,
+    event: PrivateMessageEvent,
+    args: Message,
+    *,
+    kind: str,
+) -> None:
+    if not await SUPERUSER(bot, event):
+        await matcher.finish(PERMISSION_DENIED)
 
     text = args.extract_plain_text().strip()
     if text.lower() in CANCEL_WORDS:
         _private_drafts.pop(event.user_id, None)
-        await private_always_reply_matcher.finish(CANCEL_NOTICE)
+        await matcher.finish(_draft_cancel_notice(kind))
 
     groups = await store.list_groups()
     if not groups:
-        await private_always_reply_matcher.finish(NO_KNOWN_GROUP)
+        await matcher.finish(NO_KNOWN_GROUP)
 
     group_ids = tuple(group_id for group_id, _, _ in groups)[
         :PRIVATE_GROUP_CHOICE_LIMIT
@@ -664,9 +878,34 @@ async def handle_private_always_reply(
         step="group",
         expires_at=time.monotonic() + PRIVATE_DRAFT_TTL,
         groups=group_ids,
+        kind=kind,
     )
     names = await _group_names(bot)
-    await private_always_reply_matcher.finish(_group_choice_list(group_ids, names))
+    await matcher.finish(
+        _group_choice_list(group_ids, names, label=_draft_label(kind))
+    )
+
+
+@private_always_reply_matcher.handle()
+async def handle_private_always_reply(
+    bot: Bot,
+    event: PrivateMessageEvent,
+    args: Annotated[Message, CommandArg()],
+) -> None:
+    await _start_private_member_draft(
+        private_always_reply_matcher, bot, event, args, kind="always_reply"
+    )
+
+
+@private_voice_list_matcher.handle()
+async def handle_private_voice_list(
+    bot: Bot,
+    event: PrivateMessageEvent,
+    args: Annotated[Message, CommandArg()],
+) -> None:
+    await _start_private_member_draft(
+        private_voice_list_matcher, bot, event, args, kind="voice"
+    )
 
 
 @private_draft_matcher.handle()
@@ -678,10 +917,11 @@ async def handle_private_draft(bot: Bot, event: PrivateMessageEvent) -> None:
         _private_drafts.pop(event.user_id, None)
         await private_draft_matcher.finish(PERMISSION_DENIED)
 
+    label = _draft_label(draft.kind)
     text = event.get_plaintext().strip()
     if text.lower() in CANCEL_WORDS:
         _private_drafts.pop(event.user_id, None)
-        await private_draft_matcher.finish(CANCEL_NOTICE)
+        await private_draft_matcher.finish(_draft_cancel_notice(draft.kind))
 
     if draft.step == "group":
         group_id = _select_group(draft, text)
@@ -692,7 +932,7 @@ async def handle_private_draft(bot: Bot, event: PrivateMessageEvent) -> None:
         draft.group_id = group_id
         draft.step = "member"
         draft.expires_at = time.monotonic() + PRIVATE_DRAFT_TTL
-        await private_draft_matcher.finish(_member_prompt(group_id))
+        await private_draft_matcher.finish(_member_prompt(group_id, label=label))
 
     targets = list(dict.fromkeys(int(qq) for qq in QQ_PATTERN.findall(text)))
     if not targets:
@@ -703,17 +943,20 @@ async def handle_private_draft(bot: Bot, event: PrivateMessageEvent) -> None:
     group_id = draft.group_id
     if group_id is None:
         _private_drafts.pop(event.user_id, None)
-        await private_draft_matcher.finish(CANCEL_NOTICE)
+        await private_draft_matcher.finish(_draft_cancel_notice(draft.kind))
 
+    add_member = (
+        store.add_voice_member if draft.kind == "voice" else store.add_always_reply
+    )
     added = 0
     for user_id in targets:
-        if await store.add_always_reply(group_id, user_id):
+        if await add_member(group_id, user_id):
             added += 1
     _private_drafts.pop(event.user_id, None)
     skipped = len(targets) - added
     suffix = f"，{skipped} 人原本已在名单中" if skipped else ""
     await private_draft_matcher.finish(
-        f"已加入群 {group_id} 的必回名单：{added} 人{suffix}。"
+        f"已加入群 {group_id} 的{label}：{added} 人{suffix}。"
     )
 
 
@@ -761,10 +1004,7 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
             coordinator.submit(event.group_id, memory_message, explicit=True)
         else:
             await bot.send_group_msg(
-                group_id=event.group_id,
-                message=await _outgoing_text(
-                    event.group_id, RATE_LIMIT_NOTICE, event.message_id
-                ),
+                group_id=event.group_id, message=MessageSegment.text(RATE_LIMIT_NOTICE)
             )
         raise StopPropagation
     if event.reply is not None:

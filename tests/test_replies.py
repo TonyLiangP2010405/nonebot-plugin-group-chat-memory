@@ -17,18 +17,11 @@ DIMENSIONS = 4
 BASE_TIME = datetime(2026, 11, 2, 8, 0, tzinfo=timezone.utc)
 
 
-def make_config(
-    tmp_path: Path,
-    *,
-    index: int = 0,
-    probability: float = 0.0,
-    quote_probability: float = 100.0,
-) -> Config:
+def make_config(tmp_path: Path, *, index: int = 0, probability: float = 0.0) -> Config:
     return Config(
         group_chat_memory_db_path_override=str(tmp_path / f"memory-{index}.db"),
         group_chat_memory_embedding_dimensions=DIMENSIONS,
         group_chat_memory_default_probability=probability,
-        group_chat_memory_default_quote_probability=quote_probability,
     )
 
 
@@ -408,31 +401,47 @@ class TestProbability:
         assert calls == []
 
 
-class TestQuoteProbability:
+class TestReplyMode:
     @pytest.mark.parametrize(
-        ("probability", "value", "expected"),
+        ("value", "expected"),
         [
-            (0.0, 0.0, False),
-            (100.0, 0.99, True),
-            (50.0, 0.0, True),
-            (50.0, 0.49, True),
-            (50.0, 0.5, False),
-            (50.0, 0.99, False),
-            (1.0, 0.009, True),
-            (1.0, 0.01, False),
+            (0.0, "text"),
+            (1 / 3, "quote"),
+            (0.5, "quote"),
+            (2 / 3, "voice"),
+            (0.9, "voice"),
         ],
     )
-    async def test_quote_probability_threshold(
-        self, store, make_coordinator, probability, value, expected
+    async def test_eligible_member_gets_three_equal_modes(
+        self, make_coordinator, value, expected
     ):
-        await store.set_quote_probability(100, probability)
-        coordinator = make_coordinator(FakeReply(auto=True), random_value=lambda: value)
+        coordinator = make_coordinator(
+            FakeReply(auto=True), random_value=lambda: value
+        )
 
-        assert await coordinator.should_quote(100) is expected
+        assert coordinator.choose_reply_mode(voice_available=True) == expected
 
-    @pytest.mark.parametrize(("probability", "expected"), [(0.0, False), (100.0, True)])
-    async def test_quote_bounds_never_consult_random_value(
-        self, store, make_coordinator, probability, expected
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (0.0, "text"),
+            (1 / 3, "quote"),
+            (0.5, "quote"),
+            (2 / 3, "text"),
+            (0.9, "text"),
+        ],
+    )
+    async def test_voice_share_falls_back_to_text_without_voice(
+        self, make_coordinator, value, expected
+    ):
+        coordinator = make_coordinator(
+            FakeReply(auto=True), random_value=lambda: value
+        )
+
+        assert coordinator.choose_reply_mode(voice_available=False) == expected
+
+    async def test_mode_selection_consumes_exactly_one_random_value(
+        self, make_coordinator
     ):
         calls: list[int] = []
 
@@ -440,42 +449,10 @@ class TestQuoteProbability:
             calls.append(1)
             return 0.5
 
-        await store.set_quote_probability(100, probability)
         coordinator = make_coordinator(FakeReply(auto=True), random_value=random_value)
 
-        assert await coordinator.should_quote(100) is expected
-        assert calls == []
-
-    async def test_unconfigured_group_uses_configured_default(self, make_store):
-        store = await make_store(quote_probability=0.0)
-        coordinator = ReplyCoordinator(store, FakeReply(auto=True))
-        try:
-            assert await coordinator.should_quote(999) is False
-        finally:
-            await coordinator.close()
-
-    async def test_quote_probability_changes_apply_without_restart(
-        self, store, make_coordinator
-    ):
-        coordinator = make_coordinator(FakeReply(auto=True), random_value=lambda: 0.5)
-
-        await store.set_quote_probability(100, 0.0)
-        assert await coordinator.should_quote(100) is False
-        await store.set_quote_probability(100, 100.0)
-        assert await coordinator.should_quote(100) is True
-        await store.set_quote_probability(100, 60.0)
-        assert await coordinator.should_quote(100) is True
-
-    async def test_quote_probability_is_independent_of_reply_probability(
-        self, store, make_coordinator
-    ):
-        coordinator = make_coordinator(FakeReply(auto=True), random_value=lambda: 0.5)
-
-        await store.set_probability(100, 0.0)
-        await store.set_quote_probability(100, 100.0)
-
-        assert await coordinator.should_random_reply(100) is False
-        assert await coordinator.should_quote(100) is True
+        assert coordinator.choose_reply_mode(voice_available=True) == "quote"
+        assert calls == [1]
 
 
 class TestErrorIsolation:

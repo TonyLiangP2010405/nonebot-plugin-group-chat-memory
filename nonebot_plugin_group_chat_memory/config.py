@@ -33,6 +33,9 @@ DEFAULT_SYSTEM_PROMPT = (
 DEFAULT_AFFECTION_ENABLED = True
 DEFAULT_AFFECTION_PROBABILITY = 30.0
 DEFAULT_SUPERUSER_ALWAYS_REPLY = True
+DEFAULT_TTS_VOICE_ID = "stella"
+DEFAULT_TTS_BASE_URL = "https://api.deepseek.com/v1/tools/tts"
+TTS_VOICES = {"stella": "女声（stella）", "tide": "男声（tide）"}
 
 DEFAULT_APIHZ_ID = "10023437"
 DEFAULT_APIHZ_KEY = "sk1287663323"
@@ -42,6 +45,8 @@ RUNTIME_CONFIG_DEFAULTS = {
     "chat_api_key": "",
     "chat_model": "deepseek-v4.1-flash",
     "embedding_api_key": "",
+    "tts_api_key": "",
+    "tts_voice_id": DEFAULT_TTS_VOICE_ID,
     "apihz_id": DEFAULT_APIHZ_ID,
     "apihz_key": DEFAULT_APIHZ_KEY,
 }
@@ -58,7 +63,7 @@ def _localstore_data_dir() -> Path:
 
 
 class Config(BaseModel):
-    """群聊记忆插件配置；四个模型运行时字段由私聊命令和数据库覆盖。"""
+    """群聊记忆插件配置；聊天与语音运行时字段由私聊命令和数据库覆盖。"""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -66,6 +71,11 @@ class Config(BaseModel):
     group_chat_memory_chat_api_key: SecretStr = SecretStr("")
     group_chat_memory_chat_model: str = "deepseek-v4.1-flash"
     group_chat_memory_chat_timeout: float = Field(default=60.0, gt=0)
+
+    group_chat_memory_tts_base_url: str = DEFAULT_TTS_BASE_URL
+    group_chat_memory_tts_api_key: SecretStr = SecretStr("")
+    group_chat_memory_tts_voice_id: str = DEFAULT_TTS_VOICE_ID
+    group_chat_memory_tts_timeout: float = Field(default=30.0, gt=0)
 
     group_chat_memory_embedding_base_url: str = "https://api.siliconflow.cn/v1"
     group_chat_memory_embedding_api_key: SecretStr = SecretStr("")
@@ -81,9 +91,6 @@ class Config(BaseModel):
     group_chat_memory_long_term_memories: int = Field(default=5, ge=0)
     group_chat_memory_context_max_chars: int = Field(default=6000, ge=1)
     group_chat_memory_default_probability: float = Field(default=0.0, ge=0.0, le=100.0)
-    group_chat_memory_default_quote_probability: float = Field(
-        default=100.0, ge=0.0, le=100.0
-    )
     group_chat_memory_hourly_request_limit: int = Field(default=10, ge=1, le=10000)
     group_chat_memory_meme_enabled: bool = True
     group_chat_memory_meme_api_url: str = "https://cn.apihz.cn/api/img/apihzbqbbaidu.php"
@@ -101,7 +108,7 @@ class Config(BaseModel):
         return _localstore_data_dir() / DEFAULT_DB_FILENAME
 
     def apply_runtime_config(self, values: dict[str, str]) -> None:
-        """应用数据库中的四项全局配置，未保存的字段恢复内置默认值。"""
+        """应用数据库中的全局配置，未保存的字段恢复内置默认值。"""
         for key, default in RUNTIME_CONFIG_DEFAULTS.items():
             value = values.get(key, default)
             if key == "chat_base_url":
@@ -112,6 +119,10 @@ class Config(BaseModel):
                 self.group_chat_memory_chat_model = value
             elif key == "embedding_api_key":
                 self.group_chat_memory_embedding_api_key = SecretStr(value)
+            elif key == "tts_api_key":
+                self.group_chat_memory_tts_api_key = SecretStr(value)
+            elif key == "tts_voice_id":
+                self.group_chat_memory_tts_voice_id = value or DEFAULT_TTS_VOICE_ID
             elif key == "apihz_id":
                 self.group_chat_memory_apihz_id = value
             elif key == "apihz_key":
