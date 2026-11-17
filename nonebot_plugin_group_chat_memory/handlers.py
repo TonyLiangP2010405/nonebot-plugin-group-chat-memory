@@ -241,11 +241,18 @@ async def _record_bot_reply(bot: Bot, group_id: int, text: str) -> None:
     )
 
 
-async def _restricted_member(group_id: int, user_id: int) -> bool:
-    """语音和 B站视频共用同一份名单：好感榜榜一，或 SUPERUSER 加进语音名单的人。"""
+async def _reply_permissions(group_id: int, user_id: int) -> tuple[bool, bool]:
+    """返回 (能否语音, 能否视频)。
+
+    语音只给好感榜榜一；视频放宽到好感榜前 N 名（默认 3）与语音名单成员，
+    名单里的固定群友两种形式都能用。
+    """
     if await store.is_voice_member(group_id, user_id):
-        return True
-    return await affection_leaderboard.is_top_member(group_id, user_id, limit=1)
+        return True, True
+    if await affection_leaderboard.is_top_member(group_id, user_id, limit=1):
+        return True, True
+    limit = config.group_chat_memory_video_rank_limit
+    return False, await affection_leaderboard.is_top_member(group_id, user_id, limit=limit)
 
 
 async def _synthesize(text: str) -> bytes | None:
@@ -309,10 +316,10 @@ async def reply(group_id: int, message: MemoryMessage) -> None:
         )
         return
 
-    restricted = await _restricted_member(group_id, message.user_id)
+    voice_member, video_member = await _reply_permissions(group_id, message.user_id)
     mode = coordinator.choose_reply_mode(
-        voice_available=restricted and _voice_configured(),
-        video_available=restricted and config.group_chat_memory_video_enabled,
+        voice_available=voice_member and _voice_configured(),
+        video_available=video_member and config.group_chat_memory_video_enabled,
     )
     if mode == "voice":
         if await _send_voice(bot, group_id, response):

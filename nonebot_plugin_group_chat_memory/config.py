@@ -112,6 +112,7 @@ class Config(BaseModel):
     group_chat_memory_hourly_request_limit: int = Field(default=10, ge=1, le=10000)
     group_chat_memory_meme_enabled: bool = True
     group_chat_memory_video_enabled: bool = True
+    group_chat_memory_video_rank_limit: int = Field(default=3, ge=1, le=10)
     group_chat_memory_meme_api_url: str = "https://cn.apihz.cn/api/img/apihzbqbbaidu.php"
     group_chat_memory_apihz_id: str = ""
     group_chat_memory_apihz_key: SecretStr = SecretStr("")

@@ -43,6 +43,7 @@ class TestConfigDefaults:
         assert config.group_chat_memory_hourly_request_limit == 10
         assert config.group_chat_memory_meme_enabled is True
         assert config.group_chat_memory_video_enabled is True
+        assert config.group_chat_memory_video_rank_limit == 3
         assert config.group_chat_memory_ignored_qq == set()
         assert config.group_chat_memory_db_path_override is None
 

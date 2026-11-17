@@ -1237,9 +1237,15 @@ async def test_random_rate_limit_is_silent_without_model(app: App, runtime):
 
 
 class FakeLeaderboard:
-    def __init__(self, members: set[int] | None = None, top: set[int] | None = None) -> None:
+    def __init__(
+        self,
+        members: set[int] | None = None,
+        top: set[int] | None = None,
+        ranking: list[int] | None = None,
+    ) -> None:
         self.members = members or set()
         self.top = top or set()
+        self.ranking = ranking or []
         self.calls: list[tuple[int, int]] = []
 
     async def is_member(self, group_id: int, user_id: int) -> bool:
@@ -1248,6 +1254,8 @@ class FakeLeaderboard:
 
     async def is_top_member(self, group_id: int, user_id: int, limit: int = 3) -> bool:
         self.calls.append((group_id, user_id))
+        if self.ranking:
+            return user_id in self.ranking[:limit]
         return user_id in self.top
 
 
@@ -1280,7 +1288,7 @@ async def test_leaderboard_member_replies_at_thirty_percent(app: App, runtime, m
     finally:
         await coordinator.close()
 
-    assert leaderboard.calls == [(GROUP_ID, USER_ID)] * 3
+    assert {call for call in leaderboard.calls} == {(GROUP_ID, USER_ID)}
     runtime.complete.assert_awaited_once()
 
 
@@ -1371,7 +1379,7 @@ async def test_directed_message_skips_reply_probability_leaderboard_lookup(
     app: App, runtime, monkeypatch
 ):
     runtime.get_probability.return_value = 100.0
-    leaderboard = FakeLeaderboard({USER_ID})
+    leaderboard = FakeLeaderboard({USER_ID}, {USER_ID})
     monkeypatch.setattr(handlers, "affection_leaderboard", leaderboard)
     event = make_group_event(
         Message([MessageSegment.at(BOT_ID), MessageSegment.text("你好")])
@@ -3060,6 +3068,98 @@ async def test_video_feature_can_be_disabled(app: App, runtime, monkeypatch):
 
     runtime.complete_prompt.assert_not_awaited()
     assert send_group_msg.await_args.kwargs["message"].type == "record"
+
+
+async def test_third_rank_member_gets_bilibili_video(
+    app: App, runtime, monkeypatch
+):
+    handlers.config.group_chat_memory_video_enabled = True
+    runtime.complete_prompt.return_value = '{"search": true, "keyword": "派蒙"}'
+    search = use_video(monkeypatch)
+    monkeypatch.setattr(
+        handlers,
+        "affection_leaderboard",
+        FakeLeaderboard(ranking=[9001, 9002, USER_ID]),
+    )
+    use_random(monkeypatch, 0.7)
+    event = make_group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text("来个派蒙的视频")]),
+        to_me=True,
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        send_group_msg = AsyncMock(return_value={"message_id": 123})
+        bot.send_group_msg = send_group_msg
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_until(lambda: runtime.record.await_count == 2)
+
+    search.assert_awaited_once_with("派蒙")
+    sent = send_group_msg.await_args.kwargs["message"]
+    assert sent[1] == MessageSegment.image("https://i1.hdslb.com/bfs/archive/cover.jpg")
+    runtime.synthesize.assert_not_awaited()
+
+
+async def test_fourth_rank_member_cannot_trigger_video(
+    app: App, runtime, monkeypatch
+):
+    handlers.config.group_chat_memory_video_enabled = True
+    search = use_video(monkeypatch)
+    monkeypatch.setattr(
+        handlers,
+        "affection_leaderboard",
+        FakeLeaderboard(ranking=[9001, 9002, 9003, USER_ID]),
+    )
+    use_random(monkeypatch, 0.9)
+    event = make_group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text("来个派蒙的视频")]),
+        to_me=True,
+        message_id=321,
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        send_group_msg = AsyncMock(return_value={"message_id": 123})
+        bot.send_group_msg = send_group_msg
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_until(lambda: runtime.record.await_count == 2)
+
+    runtime.complete_prompt.assert_not_awaited()
+    search.assert_not_awaited()
+    assert send_group_msg.await_args.kwargs["message"] == Message(
+        [MessageSegment.reply(321), MessageSegment.text("模型回复")]
+    )
+
+
+async def test_third_rank_member_still_gets_no_voice(app: App, runtime, monkeypatch):
+    handlers.config.group_chat_memory_video_enabled = True
+    monkeypatch.setattr(
+        handlers,
+        "affection_leaderboard",
+        FakeLeaderboard(ranking=[9001, 9002, USER_ID]),
+    )
+    use_random(monkeypatch, 0.5)
+    event = make_group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text("你好")]),
+        to_me=True,
+        message_id=321,
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        send_group_msg = AsyncMock(return_value={"message_id": 123})
+        bot.send_group_msg = send_group_msg
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_until(lambda: runtime.record.await_count == 2)
+
+    runtime.synthesize.assert_not_awaited()
+    runtime.complete_prompt.assert_not_awaited()
+    assert send_group_msg.await_args.kwargs["message"] == Message(
+        [MessageSegment.reply(321), MessageSegment.text("模型回复")]
+    )
 
 
 async def test_voice_model_query_defaults_to_deepseek(app: App, runtime):
