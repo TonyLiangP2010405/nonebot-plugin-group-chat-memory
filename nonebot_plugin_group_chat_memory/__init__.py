@@ -5,7 +5,7 @@ from .config import Config
 
 __plugin_meta__ = PluginMetadata(
     name="群聊记忆",
-    description="为群聊提供共享长期记忆、点名对话、按群概率回复和语音回复",
+    description="为群聊提供共享长期记忆、点名对话、按群概率回复、语音回复和 B站视频转发",
     usage=(
         "在群聊中 @机器人 或回复机器人的消息即可对话。\n"
         "SUPERUSER：/回复概率 [0~100] 查询或设置当前群随机回复概率；"

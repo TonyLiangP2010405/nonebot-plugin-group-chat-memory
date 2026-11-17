@@ -41,6 +41,8 @@ class TestConfigDefaults:
         assert config.group_chat_memory_tts_base_url == "https://api.deepseek.com/v1/tools/tts"
         assert config.group_chat_memory_tts_timeout == 30.0
         assert config.group_chat_memory_hourly_request_limit == 10
+        assert config.group_chat_memory_meme_enabled is True
+        assert config.group_chat_memory_video_enabled is True
         assert config.group_chat_memory_ignored_qq == set()
         assert config.group_chat_memory_db_path_override is None
 

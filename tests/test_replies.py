@@ -406,39 +406,70 @@ class TestReplyMode:
         ("value", "expected"),
         [
             (0.0, "text"),
-            (1 / 3, "quote"),
-            (0.5, "quote"),
-            (2 / 3, "voice"),
-            (0.9, "voice"),
+            (0.24, "text"),
+            (0.25, "quote"),
+            (0.5, "voice"),
+            (0.74, "voice"),
+            (0.75, "video"),
+            (0.99, "video"),
         ],
     )
-    async def test_eligible_member_gets_three_equal_modes(
+    async def test_restricted_member_gets_four_equal_modes(
         self, make_coordinator, value, expected
     ):
         coordinator = make_coordinator(
             FakeReply(auto=True), random_value=lambda: value
         )
 
-        assert coordinator.choose_reply_mode(voice_available=True) == expected
+        assert (
+            coordinator.choose_reply_mode(
+                voice_available=True, video_available=True
+            )
+            == expected
+        )
 
     @pytest.mark.parametrize(
         ("value", "expected"),
-        [
-            (0.0, "text"),
-            (1 / 3, "quote"),
-            (0.5, "quote"),
-            (2 / 3, "text"),
-            (0.9, "text"),
-        ],
+        [(0.0, "text"), (0.49, "text"), (0.5, "quote"), (0.99, "quote")],
     )
-    async def test_voice_share_falls_back_to_text_without_voice(
+    async def test_plain_member_splits_text_and_quote_evenly(
         self, make_coordinator, value, expected
     ):
         coordinator = make_coordinator(
             FakeReply(auto=True), random_value=lambda: value
         )
 
-        assert coordinator.choose_reply_mode(voice_available=False) == expected
+        assert (
+            coordinator.choose_reply_mode(
+                voice_available=False, video_available=False
+            )
+            == expected
+        )
+
+    @pytest.mark.parametrize(
+        ("voice_available", "video_available", "value", "expected"),
+        [
+            (True, False, 0.0, "text"),
+            (True, False, 0.34, "quote"),
+            (True, False, 0.7, "voice"),
+            (False, True, 0.0, "text"),
+            (False, True, 0.34, "quote"),
+            (False, True, 0.7, "video"),
+        ],
+    )
+    async def test_only_available_modes_take_part_in_the_draw(
+        self, make_coordinator, voice_available, video_available, value, expected
+    ):
+        coordinator = make_coordinator(
+            FakeReply(auto=True), random_value=lambda: value
+        )
+
+        assert (
+            coordinator.choose_reply_mode(
+                voice_available=voice_available, video_available=video_available
+            )
+            == expected
+        )
 
     async def test_mode_selection_consumes_exactly_one_random_value(
         self, make_coordinator
@@ -451,7 +482,10 @@ class TestReplyMode:
 
         coordinator = make_coordinator(FakeReply(auto=True), random_value=random_value)
 
-        assert coordinator.choose_reply_mode(voice_available=True) == "quote"
+        assert (
+            coordinator.choose_reply_mode(voice_available=True, video_available=True)
+            == "voice"
+        )
         assert calls == [1]
 
 

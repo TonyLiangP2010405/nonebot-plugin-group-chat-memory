@@ -28,6 +28,7 @@ from nonebot.permission import SUPERUSER
 
 from .affection import AffectionLeaderboard
 from .api import ChatAPIError, ChatClient, EmbeddingClient
+from .bilibili import BilibiliClient, BilibiliVideo, decide_video, video_card_text
 from .config import (
     DEFAULT_TTS_VOICE_ID,
     TTS_PROVIDERS,
@@ -240,10 +241,8 @@ async def _record_bot_reply(bot: Bot, group_id: int, text: str) -> None:
     )
 
 
-async def _voice_available(group_id: int, user_id: int) -> bool:
-    """语音只对榜一和语音名单成员开放；当前模型未配置完整时视为不可用。"""
-    if not _voice_configured():
-        return False
+async def _restricted_member(group_id: int, user_id: int) -> bool:
+    """语音和 B站视频共用同一份名单：好感榜榜一，或 SUPERUSER 加进语音名单的人。"""
     if await store.is_voice_member(group_id, user_id):
         return True
     return await affection_leaderboard.is_top_member(group_id, user_id, limit=1)
@@ -262,6 +261,39 @@ async def _synthesize(text: str) -> bytes | None:
         return None
 
 
+async def _send_voice(bot: Bot, group_id: int, text: str) -> bool:
+    """合成并发送语音；任一步失败都返回 False，由调用方退回文字。"""
+    audio = await _synthesize(text)
+    if audio is None:
+        return False
+    try:
+        await bot.send_group_msg(group_id=group_id, message=_record_segment(audio))
+    except Exception as exc:
+        logger.warning("群 %s 的语音发送失败：%s", group_id, type(exc).__name__)
+        return False
+    return True
+
+
+async def _find_video(current_text: str, response: str) -> BilibiliVideo | None:
+    """先让模型判断要不要配视频，再按它给的关键词搜 B站；任何一步失败都返回 None。"""
+    cue = await decide_video(chat_client, current_text, response)
+    if cue is None:
+        return None
+    try:
+        return await bilibili_client.search(cue.keyword)
+    except Exception as exc:
+        logger.warning("B站视频搜索失败：%s", type(exc).__name__)
+        return None
+
+
+def _video_message(video: BilibiliVideo) -> Message:
+    """视频卡片：标题/UP/数据/链接，能拿到封面就一起发。"""
+    segments = [MessageSegment.text(video_card_text(video))]
+    if video.cover:
+        segments.append(MessageSegment.image(video.cover))
+    return Message(segments)
+
+
 async def reply(group_id: int, message: MemoryMessage) -> None:
     bot = _bots[group_id]
     try:
@@ -277,22 +309,29 @@ async def reply(group_id: int, message: MemoryMessage) -> None:
         )
         return
 
+    restricted = await _restricted_member(group_id, message.user_id)
     mode = coordinator.choose_reply_mode(
-        voice_available=await _voice_available(group_id, message.user_id)
+        voice_available=restricted and _voice_configured(),
+        video_available=restricted and config.group_chat_memory_video_enabled,
     )
     if mode == "voice":
-        audio = await _synthesize(response)
-        if audio is not None:
+        if await _send_voice(bot, group_id, response):
+            await _record_bot_reply(bot, group_id, response)
+            return
+        mode = "text"
+    if mode == "video":
+        video = await _find_video(message.text, response)
+        if video is not None:
             try:
                 await bot.send_group_msg(
-                    group_id=group_id, message=_record_segment(audio)
+                    group_id=group_id, message=_video_message(video)
                 )
             except Exception as exc:
                 logger.warning(
-                    "群 %s 的语音发送失败：%s", group_id, type(exc).__name__
+                    "群 %s 的 B站视频发送失败：%s", group_id, type(exc).__name__
                 )
             else:
-                await _record_bot_reply(bot, group_id, response)
+                await _record_bot_reply(bot, group_id, video_card_text(video))
                 return
         mode = "text"
 
@@ -315,6 +354,7 @@ async def reply(group_id: int, message: MemoryMessage) -> None:
 
 coordinator = ReplyCoordinator(store, reply)
 affection_leaderboard = AffectionLeaderboard()
+bilibili_client = BilibiliClient()
 
 
 async def _eligible_group_message(bot: Bot, event: GroupMessageEvent) -> bool:

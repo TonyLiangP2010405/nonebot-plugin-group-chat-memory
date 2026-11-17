@@ -304,7 +304,7 @@ async def test_voice_reply_sends_record_and_records_text(app: App, integrated_ru
     await handlers.apply_setting("tts_api_key", "sk-tts")
     await handlers.apply_setting("tts_voice_id", "stella")
     await integrated_runtime.store.add_voice_member(GROUP_A, USER_ID)
-    handlers.coordinator._random_value = lambda: 0.9  # type: ignore[attr-defined]
+    handlers.coordinator._random_value = lambda: 0.6  # type: ignore[attr-defined]
     event = group_event(
         Message([MessageSegment.at(BOT_ID), MessageSegment.text(" 用语音说 ")]),
         to_me=True,
@@ -354,7 +354,7 @@ async def test_qwen_voice_reply_clones_reference_and_sends_record(
         "qwen_reference", "https://example.com/reference.wav"
     )
     await integrated_runtime.store.add_voice_member(GROUP_A, USER_ID)
-    handlers.coordinator._random_value = lambda: 0.9  # type: ignore[attr-defined]
+    handlers.coordinator._random_value = lambda: 0.6  # type: ignore[attr-defined]
     event = group_event(
         Message([MessageSegment.at(BOT_ID), MessageSegment.text(" 用她的声音说 ")]),
         to_me=True,

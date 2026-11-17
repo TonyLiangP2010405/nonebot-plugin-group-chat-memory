@@ -136,9 +136,22 @@ class ChatClient:
         self._config.require_chat_config()
         if not current_text.strip():
             raise ChatAPIError("当前消息为空，无法请求聊天模型。")
+        messages = build_chat_messages(self._config, context, current_text)
+        return await self._complete_messages(messages, session_id)
+
+    async def complete_prompt(
+        self, messages: list[dict[str, str]], *, session_id: str | None = None
+    ) -> str:
+        """用自定义 messages 请求一条纯文本输出，供内部判断类调用使用。"""
+        self._config.require_chat_config()
+        return await self._complete_messages(messages, session_id)
+
+    async def _complete_messages(
+        self, messages: list[dict[str, str]], session_id: str | None
+    ) -> str:
         payload = {
             "model": self._config.group_chat_memory_chat_model,
-            "messages": build_chat_messages(self._config, context, current_text),
+            "messages": messages,
         }
 
         attempts = len(self._retry_delays) + 1

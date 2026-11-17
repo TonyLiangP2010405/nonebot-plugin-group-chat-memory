@@ -90,18 +90,22 @@ class ReplyCoordinator:
             return True
         return self._random_value() < probability / 100.0
 
-    def choose_reply_mode(self, *, voice_available: bool) -> str:
-        """等概率选择回复形式：普通文字、引用文字、语音。
+    def choose_reply_mode(
+        self, *, voice_available: bool, video_available: bool = False
+    ) -> str:
+        """在可用的回复形式里等概率选一个：普通文字、引用文字、语音、B站视频。
 
-        语音仅对榜一和语音名单成员开放；语音不可用时，语音那一份回退为普通
-        文字，因此普通和引用各占一半。每次回复只消耗一次随机值。
+        语音和 B站视频只对榜一和语音名单成员开放；某个形式当前不可用时直接不参与
+        抽签，所以普通群友是文字/引用各一半，名单成员是四种形式各占四分之一。
+        每次回复只消耗一次随机值。
         """
-        roll = self._random_value()
-        if roll < 1 / 3:
-            return "text"
-        if roll < 2 / 3:
-            return "quote"
-        return "voice" if voice_available else "text"
+        modes = ["text", "quote"]
+        if voice_available:
+            modes.append("voice")
+        if video_available:
+            modes.append("video")
+        index = min(int(self._random_value() * len(modes)), len(modes) - 1)
+        return modes[index]
 
     def submit(self, group_id: int, message: Message, explicit: bool) -> None:
         """提交一条待回复消息；`explicit` 表示点名或回复触发的必须回复请求。"""

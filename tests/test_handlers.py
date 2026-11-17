@@ -25,6 +25,7 @@ from pydantic import SecretStr
 
 from nonebot_plugin_group_chat_memory import handlers
 from nonebot_plugin_group_chat_memory.api import ChatAPIError
+from nonebot_plugin_group_chat_memory.bilibili import BilibiliVideo
 from nonebot_plugin_group_chat_memory.config import Config, ConfigError
 from nonebot_plugin_group_chat_memory.models import ChatContext
 from nonebot_plugin_group_chat_memory.models import Message as MemoryMessage
@@ -125,6 +126,7 @@ async def runtime(monkeypatch):
     record = AsyncMock()
     build = AsyncMock(return_value=ChatContext())
     complete = AsyncMock(return_value="模型回复")
+    complete_prompt = AsyncMock(return_value='{"search": false}')
     get_probability = AsyncMock(return_value=0.0)
     set_probability = AsyncMock()
     clear_group = AsyncMock()
@@ -159,6 +161,7 @@ async def runtime(monkeypatch):
     monkeypatch.setattr(handlers.writer, "record", record)
     monkeypatch.setattr(handlers.context_builder, "build", build)
     monkeypatch.setattr(handlers.chat_client, "complete", complete)
+    monkeypatch.setattr(handlers.chat_client, "complete_prompt", complete_prompt)
     monkeypatch.setattr(handlers.store, "get_probability", get_probability)
     monkeypatch.setattr(handlers.store, "set_probability", set_probability)
     monkeypatch.setattr(handlers.store, "clear_group", clear_group)
@@ -216,6 +219,7 @@ async def runtime(monkeypatch):
             "group_chat_memory_qwen_model",
             "group_chat_memory_apihz_id",
             "group_chat_memory_apihz_key",
+            "group_chat_memory_video_enabled",
         )
     }
     handlers.config.group_chat_memory_tts_provider = "deepseek"
@@ -224,6 +228,8 @@ async def runtime(monkeypatch):
     handlers.config.group_chat_memory_qwen_api_key = SecretStr("")
     handlers.config.group_chat_memory_qwen_workspace_id = ""
     handlers.config.group_chat_memory_qwen_reference = ""
+    # B站视频回复只在专门的用例里打开 其余用例保持文字/引用/语音三种形式
+    handlers.config.group_chat_memory_video_enabled = False
     handlers._bots.clear()
     handlers._private_drafts.clear()
     try:
@@ -231,6 +237,7 @@ async def runtime(monkeypatch):
             record=record,
             build=build,
             complete=complete,
+            complete_prompt=complete_prompt,
             get_probability=get_probability,
             set_probability=set_probability,
             clear_group=clear_group,
@@ -638,13 +645,15 @@ async def test_voice_tts_failure_falls_back_to_text(
     assert runtime.record.await_args_list[-1].args[0].text == "模型回复"
 
 
-async def test_ineligible_voice_share_falls_back_to_text(
+async def test_ineligible_member_never_gets_voice_or_video(
     app: App, runtime, monkeypatch
 ):
+    handlers.config.group_chat_memory_video_enabled = True
     use_random(monkeypatch, 0.9)
     event = make_group_event(
         Message([MessageSegment.at(BOT_ID), MessageSegment.text("你好")]),
         to_me=True,
+        message_id=321,
     )
 
     async with app.test_matcher() as ctx:
@@ -655,10 +664,15 @@ async def test_ineligible_voice_share_falls_back_to_text(
         await ctx.run()
         await wait_until(lambda: runtime.record.await_count == 2)
 
+    # 没有资格的人只剩文字和引用两种形式 0.9 落到引用
     send_group_msg.assert_awaited_once_with(
-        group_id=GROUP_ID, message=MessageSegment.text("模型回复")
+        group_id=GROUP_ID,
+        message=Message(
+            [MessageSegment.reply(321), MessageSegment.text("模型回复")]
+        ),
     )
     runtime.synthesize.assert_not_awaited()
+    runtime.complete_prompt.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -1313,7 +1327,7 @@ async def test_group_probability_above_affection_boost_is_kept(app: App, runtime
     runtime.get_probability.return_value = 100.0
     leaderboard = FakeLeaderboard(set())
     monkeypatch.setattr(handlers, "affection_leaderboard", leaderboard)
-    coordinator = use_random(monkeypatch, 0.99)
+    coordinator = use_random(monkeypatch, 0.1)
     event = make_group_event("普通群友说话")
 
     try:
@@ -1681,7 +1695,7 @@ async def test_directed_message_still_subject_to_hourly_limit(app: App, runtime,
 async def test_always_reply_member_triggers_without_random_draw(app: App, runtime, monkeypatch):
     runtime.get_probability.return_value = 0.0
     runtime.is_always_reply.return_value = True
-    coordinator = use_random(monkeypatch, 0.99)
+    coordinator = use_random(monkeypatch, 0.1)
     event = make_group_event("名单里的人说话")
 
     try:
@@ -1707,7 +1721,7 @@ async def test_always_reply_member_triggers_without_random_draw(app: App, runtim
 async def test_always_reply_member_bypasses_exhausted_hourly_limit(app: App, runtime, monkeypatch):
     runtime.is_always_reply.return_value = True
     runtime.consume_request_slot.return_value = False
-    coordinator = use_random(monkeypatch, 1.0)
+    coordinator = use_random(monkeypatch, 0.1)
     event = make_group_event("名单里的人说话")
 
     try:
@@ -2253,7 +2267,7 @@ async def test_superuser_reply_skips_meme_when_group_switch_is_off(
     app, runtime, monkeypatch
 ):
     runtime.get_meme_enabled.return_value = False
-    coordinator = use_random(monkeypatch, 0.99)
+    coordinator = use_random(monkeypatch, 0.1)
     event = make_group_event("超管说话", user_id=SUPERUSER_ID)
 
     try:
@@ -2275,7 +2289,7 @@ async def test_superuser_reply_skips_meme_when_group_switch_is_off(
 
 async def test_superuser_triggers_without_draw_and_attaches_meme(app, runtime, monkeypatch):
     runtime.get_probability.return_value = 0.0
-    coordinator = use_random(monkeypatch, 0.99)
+    coordinator = use_random(monkeypatch, 0.1)
     event = make_group_event("超管说话", user_id=SUPERUSER_ID)
 
     try:
@@ -2883,6 +2897,171 @@ async def test_voice_send_failure_falls_back_to_text(
     assert runtime.record.await_args_list[-1].args[0].text == "模型回复"
 
 
+VIDEO = BilibiliVideo(
+    title="派蒙本体能带到大世界？【原神】",
+    author="一半月X",
+    url="https://www.bilibili.com/video/BV1g9sW6DEC9",
+    cover="https://i1.hdslb.com/bfs/archive/cover.jpg",
+    play=37033,
+    like=2167,
+    review=39,
+)
+
+
+def use_video(monkeypatch, video: BilibiliVideo | None = VIDEO, *, error=None):
+    search = AsyncMock(return_value=video)
+    if error is not None:
+        search.side_effect = error
+    monkeypatch.setattr(handlers.bilibili_client, "search", search)
+    return search
+
+
+async def test_voice_member_gets_bilibili_video_on_video_roll(
+    app: App, runtime, monkeypatch
+):
+    runtime.is_voice_member.return_value = True
+    handlers.config.group_chat_memory_video_enabled = True
+    runtime.complete_prompt.return_value = '{"search": true, "keyword": " 派蒙 "}'
+    search = use_video(monkeypatch)
+    use_random(monkeypatch, 0.9)
+    event = make_group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text("来个派蒙的视频")]),
+        to_me=True,
+        message_id=321,
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        send_group_msg = AsyncMock(return_value={"message_id": 123})
+        bot.send_group_msg = send_group_msg
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_until(lambda: runtime.record.await_count == 2)
+
+    send_group_msg.assert_awaited_once_with(
+        group_id=GROUP_ID,
+        message=Message(
+            [
+                MessageSegment.text(handlers.video_card_text(VIDEO)),
+                MessageSegment.image("https://i1.hdslb.com/bfs/archive/cover.jpg"),
+            ]
+        ),
+    )
+    search.assert_awaited_once_with("派蒙")
+    assert runtime.complete_prompt.await_args.args[0][1]["content"] == (
+        "群友说：来个派蒙的视频\n馒头准备回复：模型回复"
+    )
+    assert runtime.complete_prompt.await_args.args[0][0]["role"] == "system"
+    assert runtime.record.await_args_list[-1].args[0].text == handlers.video_card_text(
+        VIDEO
+    )
+    runtime.synthesize.assert_not_awaited()
+
+
+async def test_video_roll_falls_back_to_text_when_model_declines(
+    app: App, runtime, monkeypatch
+):
+    runtime.is_voice_member.return_value = True
+    handlers.config.group_chat_memory_video_enabled = True
+    search = use_video(monkeypatch)
+    use_random(monkeypatch, 0.9)
+    event = make_group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text("你好")]),
+        to_me=True,
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        send_group_msg = AsyncMock(return_value={"message_id": 123})
+        bot.send_group_msg = send_group_msg
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_until(lambda: runtime.record.await_count == 2)
+
+    send_group_msg.assert_awaited_once_with(
+        group_id=GROUP_ID, message=MessageSegment.text("模型回复")
+    )
+    search.assert_not_awaited()
+    assert runtime.record.await_args_list[-1].args[0].text == "模型回复"
+
+
+async def test_video_roll_falls_back_to_text_when_search_fails(
+    app: App, runtime, monkeypatch
+):
+    runtime.is_voice_member.return_value = True
+    handlers.config.group_chat_memory_video_enabled = True
+    runtime.complete_prompt.return_value = '{"search": true, "keyword": "派蒙"}'
+    use_video(monkeypatch, error=RuntimeError("boom"))
+    use_random(monkeypatch, 0.9)
+    event = make_group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text("来个派蒙的视频")]),
+        to_me=True,
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        send_group_msg = AsyncMock(return_value={"message_id": 123})
+        bot.send_group_msg = send_group_msg
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_until(lambda: runtime.record.await_count == 2)
+
+    send_group_msg.assert_awaited_once_with(
+        group_id=GROUP_ID, message=MessageSegment.text("模型回复")
+    )
+
+
+async def test_video_send_failure_falls_back_to_text(
+    app: App, runtime, monkeypatch
+):
+    runtime.is_voice_member.return_value = True
+    handlers.config.group_chat_memory_video_enabled = True
+    runtime.complete_prompt.return_value = '{"search": true, "keyword": "派蒙"}'
+    use_video(monkeypatch)
+    use_random(monkeypatch, 0.9)
+    event = make_group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text("来个派蒙的视频")]),
+        to_me=True,
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        send_group_msg = AsyncMock(
+            side_effect=[RuntimeError("card unsupported"), {"message_id": 123}]
+        )
+        bot.send_group_msg = send_group_msg
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_until(lambda: runtime.record.await_count == 2)
+
+    assert send_group_msg.await_count == 2
+    first, second = (call.kwargs["message"] for call in send_group_msg.await_args_list)
+    assert first[0].type == "text"
+    assert second == MessageSegment.text("模型回复")
+    assert runtime.record.await_args_list[-1].args[0].text == "模型回复"
+
+
+async def test_video_feature_can_be_disabled(app: App, runtime, monkeypatch):
+    runtime.is_voice_member.return_value = True
+    handlers.config.group_chat_memory_video_enabled = False
+    use_random(monkeypatch, 0.9)
+    event = make_group_event(
+        Message([MessageSegment.at(BOT_ID), MessageSegment.text("你好")]),
+        to_me=True,
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        send_group_msg = AsyncMock(return_value={"message_id": 123})
+        bot.send_group_msg = send_group_msg
+        ctx.receive_event(bot, event)
+        await ctx.run()
+        await wait_until(lambda: runtime.record.await_count == 2)
+
+    runtime.complete_prompt.assert_not_awaited()
+    assert send_group_msg.await_args.kwargs["message"].type == "record"
+
+
 async def test_voice_model_query_defaults_to_deepseek(app: App, runtime):
     event = make_private_event(content="/设置语音模型", user_id=SUPERUSER_ID)
 
@@ -3117,7 +3296,7 @@ async def test_qwen_without_reference_falls_back_to_text(
     handlers.config.group_chat_memory_qwen_api_key = SecretStr("sk-qwen")
     handlers.config.group_chat_memory_qwen_workspace_id = "ws-test"
     handlers.config.group_chat_memory_qwen_reference = ""
-    use_random(monkeypatch, 0.9)
+    use_random(monkeypatch, 0.1)
     event = make_group_event(
         Message([MessageSegment.at(BOT_ID), MessageSegment.text("你好")]),
         to_me=True,
