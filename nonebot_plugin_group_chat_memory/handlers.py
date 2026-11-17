@@ -76,6 +76,13 @@ INVALID_QWEN_WORKSPACE = "阿里云百炼业务空间 ID 只能包含字母、�
 INVALID_QWEN_REFERENCE = (
     "参考音频需为 http(s) URL，或服务器上的 WAV/MP3/OGG 文件路径，且不超过 10 MB。"
 )
+QWEN_REFERENCE_USAGE = (
+    "用法：/设置语音参考（查看列表）｜/设置语音参考 <URL或路径>（直接设置）｜"
+    "/设置语音参考 添加 <名称> <URL或路径>｜/设置语音参考 切换 <序号或名称>｜"
+    "/设置语音参考 删除 <序号或名称>｜/设置语音参考 清除"
+)
+QWEN_REFERENCE_NOT_FOUND = "没有这个语音参考，先发送 /设置语音参考 查看列表。"
+QWEN_REFERENCE_NAME_LIMIT = 20
 QWEN_REFERENCE_MAX_BYTES = 10 * 1024 * 1024
 VOICE_PROVIDER_ALIASES = {
     "deepseek": "deepseek",
@@ -167,6 +174,7 @@ async def startup() -> None:
     await store.open()
     config.apply_runtime_config(await store.get_runtime_config())
     _refresh_meme_provider()
+    await _register_current_reference()
     writer.start()
 
 
@@ -668,6 +676,131 @@ async def handle_qwen_workspace(
     await qwen_workspace_matcher.finish("阿里云百炼业务空间已更新。")
 
 
+async def _register_current_reference() -> None:
+    """把当前正在用的参考音频补进预设列表，方便之后切换回来。"""
+    current = config.group_chat_memory_qwen_reference.strip()
+    if not current:
+        return
+    references = await store.list_voice_references()
+    if any(source == current for _, source in references):
+        return
+    default = "馒头" if Path(current).name == MANTOU_VOICE_FILENAME else _reference_name(current)
+    taken = {name for name, _ in references}
+    name, suffix = default, 2
+    while name in taken:
+        name, suffix = f"{default}{suffix}", suffix + 1
+    try:
+        await store.add_voice_reference(name, current)
+    except Exception as exc:
+        logger.warning("登记当前语音参考失败：%s", type(exc).__name__)
+
+
+def _reference_name(source: str) -> str:
+    """给参考来源取默认预设名：链接统一叫“链接”，本地文件用文件名。"""
+    value = source.strip()
+    if value.lower().startswith(("http://", "https://")):
+        return "链接"
+    return Path(value).stem[:QWEN_REFERENCE_NAME_LIMIT] or "语音参考"
+
+
+def _reference_display(source: str) -> str:
+    """列表里的来源展示：本地文件只显示文件名，链接显示域名。"""
+    value = source.strip()
+    if not value:
+        return "未配置"
+    if value.lower().startswith(("http://", "https://")):
+        return urlparse(value).netloc or value
+    return Path(value).name
+
+
+def _reference_hint() -> str:
+    if _voice_provider() == "qwen":
+        return ""
+    return "当前语音模型是 DeepSeek，参考音频只在 Qwen 下生效，需要时用 /设置语音模型 qwen 切换。"
+
+
+def _resolve_reference(value: str) -> str | None:
+    """校验 URL 或服务器本地音频，返回规范化后的值；不合法返回 None。"""
+    text = value.strip()
+    if not text:
+        return None
+    if text.lower().startswith(("http://", "https://")):
+        return text if _valid_http_url(text) else None
+    path = Path(text).expanduser()
+    if (
+        not path.is_file()
+        or path.suffix.lower() not in QWEN_REFERENCE_SUFFIXES
+        or path.stat().st_size > QWEN_REFERENCE_MAX_BYTES
+    ):
+        return None
+    return str(path.resolve())
+
+
+def _find_reference(
+    references: list[tuple[str, str]], target: str
+) -> tuple[str, str] | None:
+    """按序号或名称查找预设。"""
+    value = target.strip()
+    if not value:
+        return None
+    if value.isdigit():
+        index = int(value)
+        return references[index - 1] if 1 <= index <= len(references) else None
+    for name, source in references:
+        if name == value:
+            return name, source
+    return None
+
+
+async def _reference_list_text() -> str:
+    current = config.group_chat_memory_qwen_reference.strip()
+    references = await store.list_voice_references()
+    current_name = next((name for name, source in references if source == current), "")
+    if current and current_name:
+        current_text = f"{current_name}（{_reference_display(current)}）"
+    else:
+        current_text = _reference_display(current)
+    lines = [f"当前语音参考：{current_text}"]
+    if not references:
+        lines.append("还没有保存的语音参考，直接发送 /设置语音参考 <URL或路径> 添加。")
+        return "\n".join(lines)
+    lines.append(f"语音参考列表（{len(references)} 个）：")
+    for index, (name, source) in enumerate(references, start=1):
+        mark = "  ← 当前" if source == current else ""
+        lines.append(f"{index}. {name}（{_reference_display(source)}）{mark}")
+    lines.append("发送 /设置语音参考 切换 <序号或名称> 切换。")
+    return "\n".join(lines)
+
+
+async def _delete_reference(matcher, name: str, source: str) -> None:
+    try:
+        await store.remove_voice_reference(name)
+    except Exception as exc:
+        logger.error("删除语音参考失败：%s", type(exc).__name__)
+        await matcher.finish("删除失败，请稍后再试。")
+    if source != config.group_chat_memory_qwen_reference.strip():
+        await matcher.finish(f"已删除语音参考：{name}。")
+    try:
+        await apply_setting("qwen_reference", "")
+    except Exception as exc:
+        logger.error("清空语音参考失败：%s", type(exc).__name__)
+        await matcher.finish(f"已删除语音参考：{name}，但清空当前参考失败，请稍后重试。")
+    await matcher.finish(f"已删除语音参考：{name}，它正在使用，当前参考已清空。")
+
+
+async def _apply_reference(matcher, name: str, source: str) -> None:
+    try:
+        await apply_setting("qwen_reference", source)
+    except Exception as exc:
+        logger.error("保存语音参考失败：%s", type(exc).__name__)
+        await matcher.finish("配置保存失败，请稍后再试。")
+    hint = _reference_hint()
+    suffix = f" {hint}" if hint else ""
+    await matcher.finish(
+        f"语音参考已切换为：{name}（{_reference_display(source)}）。{suffix}"
+    )
+
+
 @qwen_reference_matcher.handle()
 async def handle_qwen_reference(
     bot: Bot,
@@ -681,9 +814,7 @@ async def handle_qwen_reference(
 
     text = args.extract_plain_text().strip()
     if not text:
-        await qwen_reference_matcher.finish(
-            f"当前语音参考：{_reference_label(config.group_chat_memory_qwen_reference)}"
-        )
+        await qwen_reference_matcher.finish(await _reference_list_text())
     if text.lower() in {"清除", "清空", "none", "off", "reset"}:
         try:
             await apply_setting("qwen_reference", "")
@@ -692,26 +823,52 @@ async def handle_qwen_reference(
             await qwen_reference_matcher.finish("配置保存失败，请稍后再试。")
         await qwen_reference_matcher.finish("语音参考已清除。")
 
-    value = text
-    if value.lower().startswith(("http://", "https://")):
-        if not _valid_http_url(value):
-            await qwen_reference_matcher.finish(INVALID_QWEN_REFERENCE)
-    else:
-        path = Path(value).expanduser()
-        if (
-            not path.is_file()
-            or path.suffix.lower() not in QWEN_REFERENCE_SUFFIXES
-            or path.stat().st_size > QWEN_REFERENCE_MAX_BYTES
-        ):
-            await qwen_reference_matcher.finish(INVALID_QWEN_REFERENCE)
-        value = str(path.resolve())
+    action, _, rest = text.partition(" ")
+    rest = rest.strip()
+    if action in {"添加", "切换", "删除"}:
+        references = await store.list_voice_references()
+        if action == "切换":
+            entry = _find_reference(references, rest)
+            if entry is None:
+                await qwen_reference_matcher.finish(QWEN_REFERENCE_NOT_FOUND)
+            await _apply_reference(qwen_reference_matcher, *entry)
+        if action == "删除":
+            entry = _find_reference(references, rest)
+            if entry is None:
+                await qwen_reference_matcher.finish(QWEN_REFERENCE_NOT_FOUND)
+            await _delete_reference(qwen_reference_matcher, *entry)
 
-    try:
-        await apply_setting("qwen_reference", value)
-    except Exception as exc:
-        logger.error("保存语音参考失败：%s", type(exc).__name__)
-        await qwen_reference_matcher.finish("配置保存失败，请稍后再试。")
-    await qwen_reference_matcher.finish("语音参考已更新。")
+        name, _, source_text = rest.partition(" ")
+        name, source_text = name.strip(), source_text.strip()
+        if not name or not source_text:
+            await qwen_reference_matcher.finish(QWEN_REFERENCE_USAGE)
+        if len(name) > QWEN_REFERENCE_NAME_LIMIT:
+            await qwen_reference_matcher.finish(
+                f"语音参考名称最多 {QWEN_REFERENCE_NAME_LIMIT} 个字符。"
+            )
+        source = _resolve_reference(source_text)
+        if source is None:
+            await qwen_reference_matcher.finish(INVALID_QWEN_REFERENCE)
+        try:
+            await store.add_voice_reference(name, source)
+        except Exception as exc:
+            logger.error("保存语音参考失败：%s", type(exc).__name__)
+            await qwen_reference_matcher.finish("配置保存失败，请稍后再试。")
+        await _apply_reference(qwen_reference_matcher, name, source)
+
+    source = _resolve_reference(text)
+    if source is None:
+        await qwen_reference_matcher.finish(INVALID_QWEN_REFERENCE)
+    references = await store.list_voice_references()
+    name = next((name for name, value in references if value == source), "")
+    if not name:
+        name = _reference_name(source)
+        try:
+            await store.add_voice_reference(name, source)
+        except Exception as exc:
+            logger.error("保存语音参考失败：%s", type(exc).__name__)
+            await qwen_reference_matcher.finish("配置保存失败，请稍后再试。")
+    await _apply_reference(qwen_reference_matcher, name, source)
 
 
 @mantou_voice_matcher.handle()
@@ -740,6 +897,7 @@ async def handle_mantou_voice(bot: Bot, event: MessageEvent) -> None:
         path.write_bytes(audio)
         await apply_setting("qwen_reference", str(path))
         await apply_setting("tts_provider", "qwen")
+        await store.add_voice_reference("馒头", str(path))
     except Exception as exc:
         logger.error("保存馒头音色失败：%s", type(exc).__name__)
         await mantou_voice_matcher.finish("馒头音色保存失败，请稍后再试。")

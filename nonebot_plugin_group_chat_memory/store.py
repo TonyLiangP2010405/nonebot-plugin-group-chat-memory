@@ -79,6 +79,13 @@ _SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS voice_references (
+        name TEXT PRIMARY KEY,
+        source TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS request_usage (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         group_id INTEGER NOT NULL REFERENCES groups(group_id) ON DELETE CASCADE,
@@ -599,6 +606,46 @@ class MemoryStore:
             rows = await cursor.fetchall()
             await cursor.close()
         return [(int(row["user_id"]), str(row["display_name"])) for row in rows]
+
+    async def list_voice_references(self) -> list[tuple[str, str]]:
+        """返回已保存的语音参考预设 (名称, 来源)，按添加顺序排列。"""
+        async with self._lock:
+            db = self._require_db()
+            cursor = await db.execute(
+                "SELECT name, source FROM voice_references ORDER BY created_at, name"
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [(str(row["name"]), str(row["source"])) for row in rows]
+
+    async def add_voice_reference(self, name: str, source: str) -> bool:
+        """保存或覆盖一条语音参考预设；返回是否新增（同名时更新来源）。"""
+        async with self._transaction() as db:
+            cursor = await db.execute(
+                "SELECT 1 FROM voice_references WHERE name = ?", (name,)
+            )
+            existed = await cursor.fetchone() is not None
+            await cursor.close()
+            await db.execute(
+                "DELETE FROM voice_references WHERE source = ? AND name <> ?",
+                (source, name),
+            )
+            await db.execute(
+                "INSERT INTO voice_references(name, source, created_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(name) DO UPDATE SET source = excluded.source",
+                (name, source, _format_timestamp(_utc_now())),
+            )
+        return not existed
+
+    async def remove_voice_reference(self, name: str) -> bool:
+        """删除一条语音参考预设，返回是否真的删除了记录。"""
+        async with self._transaction() as db:
+            cursor = await db.execute(
+                "DELETE FROM voice_references WHERE name = ?", (name,)
+            )
+            removed = cursor.rowcount
+            await cursor.close()
+        return bool(removed)
 
     async def list_groups(self) -> list[tuple[int, int, str | None]]:
         """返回插件记录过的群：(群号, 消息数, 最后一条消息时间)，最近活跃在前。"""

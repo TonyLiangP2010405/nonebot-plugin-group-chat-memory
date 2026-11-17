@@ -75,6 +75,8 @@ COMMAND_START=["/"]
 
 如果使用**千问AI平台**（`platform.qianwenai.com`），只填 API Key 即可，插件默认走 `https://maas.qianwenaiapi.com/api/v1/services/audio/tts/SpeechSynthesizer`，不需要业务空间。如果使用**阿里云百炼**，再补一条 `/设置阿里云空间 <WorkspaceId>`，插件会改走 `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/...`。
 
+参考音频会存成带名字的预设，可以用 `/设置语音参考` 查看列表、`/设置语音参考 切换 <序号或名称>` 来回切换；升级后第一次启动会把正在用的参考自动登记进列表（`mantou_voice.wav` 记作「馒头」），`/生成馒头音色` 也会把生成的音色登记为「馒头」。
+
 `/设置语音参考` 也接受 Bot 所在服务器上的本地文件路径（WAV/MP3/OGG/OPUS，≤10 MB、约 30 秒内）。参考音频最多 3 条由模型支持，本插件当前只用 1 条。**请只使用本人授权的声音素材；插件不内置、不抓取任何主播或他人的音频。** Qwen 的提示词上限 3000 字符，模型按音频 token 计费。
 
 ### 固定“馒头”音色（不指向任何真人）
@@ -162,8 +164,12 @@ SUPERUSER 还可以引用一条群消息发送 `/语音`，Bot 会针对被引�
 | `/设置语音音色 [stella/tide]` | 仅私聊 SUPERUSER | DeepSeek 专用：查询或切换音色；`stella` 女声（默认），`tide` 男声。 |
 | `/设置阿里云密钥 <KEY>` | 仅私聊 SUPERUSER | 设置阿里云百炼 DashScope API Key。 |
 | `/设置阿里云空间 <WorkspaceId>` | 仅私聊 SUPERUSER | 可选：设置百炼业务空间 ID；不设置时默认走千问AI平台端点。 |
-| `/设置语音参考 <URL或路径>` | 仅私聊 SUPERUSER | 设置 Qwen 参考音频；支持公网 URL 或服务器本地 WAV/MP3/OGG 路径。 |
-| `/设置语音参考 清除` | 仅私聊 SUPERUSER | 清除 Qwen 参考音频。 |
+| `/设置语音参考` | 仅私聊 SUPERUSER | 查看当前参考音频和已保存的参考列表。 |
+| `/设置语音参考 <URL或路径>` | 仅私聊 SUPERUSER | 设置并记住参考音频；支持公网 URL 或服务器本地 WAV/MP3/OGG 路径。 |
+| `/设置语音参考 添加 <名称> <URL或路径>` | 仅私聊 SUPERUSER | 保存一条新的参考预设并立即切换过去；名称最多 20 字。 |
+| `/设置语音参考 切换 <序号或名称>` | 仅私聊 SUPERUSER | 在已保存的参考之间切换，例如 `/设置语音参考 切换 馒头`。 |
+| `/设置语音参考 删除 <序号或名称>` | 仅私聊 SUPERUSER | 删除一条参考预设；删的是正在用的那条时会顺手清空当前参考。 |
+| `/设置语音参考 清除` | 仅私聊 SUPERUSER | 清空当前参考音频，已保存的预设列表保留，随时可以切回来。 |
 | `/生成馒头音色` | 仅私聊 SUPERUSER | 按元气小女孩/可莉风格描述生成原创参考音频，保存并切换 Qwen 后端。 |
 | `/导出馒头音色` | 仅私聊 SUPERUSER | 把已生成的 `mantou_voice.wav` 作为私聊文件导出；不支持文件上传时发语音。 |
 | `/设置表情包ID <数字ID>` | 仅私聊 SUPERUSER | 设置接口盒子开发者数字 ID，必须是数字。 |

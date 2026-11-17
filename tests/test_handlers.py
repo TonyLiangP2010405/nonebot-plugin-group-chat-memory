@@ -152,6 +152,9 @@ async def runtime(monkeypatch):
     list_voice_member = AsyncMock(return_value=[])
     list_groups = AsyncMock(return_value=[])
     synthesize = AsyncMock(return_value=b"audio-bytes")
+    list_voice_references = AsyncMock(return_value=[])
+    add_voice_reference = AsyncMock(return_value=True)
+    remove_voice_reference = AsyncMock(return_value=True)
     qwen_synthesize = AsyncMock(return_value=b"qwen-audio")
     qwen_sample = AsyncMock(return_value=b"mantou-audio")
     consume_request_slot = AsyncMock(return_value=True)
@@ -194,6 +197,13 @@ async def runtime(monkeypatch):
     monkeypatch.setattr(handlers.store, "remove_voice_member", remove_voice_member)
     monkeypatch.setattr(handlers.store, "clear_voice_member", clear_voice_member)
     monkeypatch.setattr(handlers.store, "list_voice_member", list_voice_member)
+    monkeypatch.setattr(
+        handlers.store, "list_voice_references", list_voice_references
+    )
+    monkeypatch.setattr(handlers.store, "add_voice_reference", add_voice_reference)
+    monkeypatch.setattr(
+        handlers.store, "remove_voice_reference", remove_voice_reference
+    )
     monkeypatch.setattr(handlers.store, "list_groups", list_groups)
     monkeypatch.setattr(handlers.tts_client, "synthesize", synthesize)
     monkeypatch.setattr(handlers.qwen_tts_client, "synthesize", qwen_synthesize)
@@ -262,6 +272,9 @@ async def runtime(monkeypatch):
             remove_voice_member=remove_voice_member,
             clear_voice_member=clear_voice_member,
             list_voice_member=list_voice_member,
+            list_voice_references=list_voice_references,
+            add_voice_reference=add_voice_reference,
+            remove_voice_reference=remove_voice_reference,
             list_groups=list_groups,
             synthesize=synthesize,
             qwen_synthesize=qwen_synthesize,
@@ -3289,7 +3302,10 @@ async def test_qwen_reference_set_url_and_clear(app: App, runtime, monkeypatch):
     async with app.test_matcher() as ctx:
         bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
         ctx.should_call_send(
-            query, "当前语音参考：未配置", result=None, bot=bot
+            query,
+            "当前语音参考：未配置\n还没有保存的语音参考，直接发送 /设置语音参考 <URL或路径> 添加。",
+            result=None,
+            bot=bot,
         )
         ctx.receive_event(bot, query)
         ctx.should_finished(handlers.qwen_reference_matcher)
@@ -3299,7 +3315,14 @@ async def test_qwen_reference_set_url_and_clear(app: App, runtime, monkeypatch):
     )
     async with app.test_matcher() as ctx:
         bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
-        ctx.should_call_send(update, "语音参考已更新。", result=None, bot=bot)
+        ctx.should_call_send(
+            update,
+            "语音参考已切换为：链接（example.com）。"
+            " 当前语音模型是 DeepSeek，参考音频只在 Qwen 下生效，"
+            "需要时用 /设置语音模型 qwen 切换。",
+            result=None,
+            bot=bot,
+        )
         ctx.receive_event(bot, update)
         ctx.should_finished(handlers.qwen_reference_matcher)
 
@@ -3332,7 +3355,14 @@ async def test_qwen_reference_accepts_local_file(
 
     async with app.test_matcher() as ctx:
         bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
-        ctx.should_call_send(event, "语音参考已更新。", result=None, bot=bot)
+        ctx.should_call_send(
+            event,
+            "语音参考已切换为：xiaoxiao（xiaoxiao.wav）。"
+            " 当前语音模型是 DeepSeek，参考音频只在 Qwen 下生效，"
+            "需要时用 /设置语音模型 qwen 切换。",
+            result=None,
+            bot=bot,
+        )
         ctx.receive_event(bot, event)
         ctx.should_finished(handlers.qwen_reference_matcher)
 
@@ -3355,6 +3385,148 @@ async def test_qwen_reference_rejects_missing_file(app: App, runtime, monkeypatc
         ctx.should_finished(handlers.qwen_reference_matcher)
 
     setter.assert_not_awaited()
+
+
+def use_references(runtime, references: list[tuple[str, str]]) -> None:
+    runtime.list_voice_references.return_value = references
+
+
+async def test_qwen_reference_list_marks_current_preset(app: App, runtime):
+    handlers.config.group_chat_memory_tts_provider = "qwen"
+    handlers.config.group_chat_memory_qwen_reference = "/data/mantou_voice.wav"
+    use_references(
+        runtime,
+        [("馒头", "/data/mantou_voice.wav"), ("参考语音", "/data/参考语音.mp3")],
+    )
+    event = make_private_event(content="/设置语音参考", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event,
+            "当前语音参考：馒头（mantou_voice.wav）\n"
+            "语音参考列表（2 个）：\n"
+            "1. 馒头（mantou_voice.wav）  ← 当前\n"
+            "2. 参考语音（参考语音.mp3）\n"
+            "发送 /设置语音参考 切换 <序号或名称> 切换。",
+            result=None,
+            bot=bot,
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.qwen_reference_matcher)
+
+
+async def test_qwen_reference_switch_by_index_and_name(
+    app: App, runtime, monkeypatch
+):
+    handlers.config.group_chat_memory_tts_provider = "qwen"
+    handlers.config.group_chat_memory_qwen_reference = "/data/mantou_voice.wav"
+    setter = AsyncMock()
+    monkeypatch.setattr(handlers.store, "set_runtime_config", setter)
+    use_references(
+        runtime,
+        [("馒头", "/data/mantou_voice.wav"), ("参考语音", "/data/参考语音.mp3")],
+    )
+
+    cases = (
+        ("/设置语音参考 切换 2", "参考语音", "参考语音.mp3"),
+        ("/设置语音参考 切换 馒头", "馒头", "mantou_voice.wav"),
+    )
+    for content, name, display in cases:
+        event = make_private_event(content=content, user_id=SUPERUSER_ID)
+        async with app.test_matcher() as ctx:
+            bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+            ctx.should_call_send(
+                event,
+                f"语音参考已切换为：{name}（{display}）。",
+                result=None,
+                bot=bot,
+            )
+            ctx.receive_event(bot, event)
+            ctx.should_finished(handlers.qwen_reference_matcher)
+
+    assert handlers.config.group_chat_memory_qwen_reference == "/data/mantou_voice.wav"
+    assert setter.await_count == 2
+
+
+async def test_qwen_reference_switch_reports_unknown_target(app: App, runtime):
+    use_references(runtime, [("馒头", "/data/mantou_voice.wav")])
+    event = make_private_event(content="/设置语音参考 切换 9", user_id=SUPERUSER_ID)
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, handlers.QWEN_REFERENCE_NOT_FOUND, result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.qwen_reference_matcher)
+
+
+async def test_qwen_reference_add_registers_and_switches(
+    app: App, runtime, monkeypatch, tmp_path
+):
+    handlers.config.group_chat_memory_tts_provider = "qwen"
+    setter = AsyncMock()
+    monkeypatch.setattr(handlers.store, "set_runtime_config", setter)
+    reference = tmp_path / "参考语音.mp3"
+    reference.write_bytes(b"mp3")
+    event = make_private_event(
+        content=f"/设置语音参考 添加 参考语音 {reference}", user_id=SUPERUSER_ID
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event,
+            "语音参考已切换为：参考语音（参考语音.mp3）。",
+            result=None,
+            bot=bot,
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.qwen_reference_matcher)
+
+    runtime.add_voice_reference.assert_awaited_once_with(
+        "参考语音", str(reference.resolve())
+    )
+    setter.assert_awaited_once_with("qwen_reference", str(reference.resolve()))
+
+
+async def test_qwen_reference_add_rejects_missing_file(app: App, runtime):
+    event = make_private_event(
+        content="/设置语音参考 添加 坏的 /no/such/voice.mp3", user_id=SUPERUSER_ID
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event, handlers.INVALID_QWEN_REFERENCE, result=None, bot=bot
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.qwen_reference_matcher)
+
+    runtime.add_voice_reference.assert_not_awaited()
+
+
+async def test_qwen_reference_delete_active_clears_current(app: App, runtime):
+    handlers.config.group_chat_memory_qwen_reference = "/data/mantou_voice.wav"
+    use_references(runtime, [("馒头", "/data/mantou_voice.wav")])
+    event = make_private_event(
+        content="/设置语音参考 删除 馒头", user_id=SUPERUSER_ID
+    )
+
+    async with app.test_matcher() as ctx:
+        bot = ctx.create_bot(base=Bot, self_id=str(BOT_ID))
+        ctx.should_call_send(
+            event,
+            "已删除语音参考：馒头，它正在使用，当前参考已清空。",
+            result=None,
+            bot=bot,
+        )
+        ctx.receive_event(bot, event)
+        ctx.should_finished(handlers.qwen_reference_matcher)
+
+    runtime.remove_voice_reference.assert_awaited_once_with("馒头")
+    assert handlers.config.group_chat_memory_qwen_reference == ""
 
 
 async def test_qwen_provider_voice_reply_uses_qwen_client(
@@ -3470,10 +3642,45 @@ async def test_generate_mantou_voice_saves_sample_and_switches_provider(
     ]
     assert handlers.config.group_chat_memory_qwen_reference == str(sample)
     assert handlers.config.group_chat_memory_tts_provider == "qwen"
+    runtime.add_voice_reference.assert_awaited_once_with("馒头", str(sample))
     runtime.qwen_sample.assert_awaited_once_with(
         handlers.MANTOU_VOICE_SAMPLE,
         description=handlers.MANTOU_VOICE_DESCRIPTION,
     )
+
+
+async def test_startup_registers_current_reference_as_mantou(app: App, runtime):
+    handlers.config.group_chat_memory_qwen_reference = "/data/mantou_voice.wav"
+    use_references(runtime, [])
+    runtime.add_voice_reference.reset_mock()
+
+    await handlers._register_current_reference()
+
+    runtime.add_voice_reference.assert_awaited_once_with(
+        "馒头", "/data/mantou_voice.wav"
+    )
+
+
+async def test_startup_skips_unknown_name_clash(app: App, runtime):
+    handlers.config.group_chat_memory_qwen_reference = "/data/参考语音.mp3"
+    use_references(runtime, [("参考语音", "/data/old.wav")])
+    runtime.add_voice_reference.reset_mock()
+
+    await handlers._register_current_reference()
+
+    runtime.add_voice_reference.assert_awaited_once_with(
+        "参考语音2", "/data/参考语音.mp3"
+    )
+
+
+async def test_startup_keeps_known_reference(app: App, runtime):
+    handlers.config.group_chat_memory_qwen_reference = "/data/mantou_voice.wav"
+    use_references(runtime, [("馒头", "/data/mantou_voice.wav")])
+    runtime.add_voice_reference.reset_mock()
+
+    await handlers._register_current_reference()
+
+    runtime.add_voice_reference.assert_not_awaited()
 
 
 async def test_generate_mantou_voice_requires_qwen_configuration(app: App, runtime):

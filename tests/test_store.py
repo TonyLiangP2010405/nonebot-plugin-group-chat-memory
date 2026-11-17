@@ -294,6 +294,53 @@ class TestVoiceMembers:
             await store.close()
 
 
+class TestVoiceReferences:
+    async def test_add_and_list_references(self, store):
+        assert await store.add_voice_reference("馒头", "/data/mantou_voice.wav") is True
+        assert await store.add_voice_reference("参考语音", "/data/ref.mp3") is True
+
+        assert await store.list_voice_references() == [
+            ("馒头", "/data/mantou_voice.wav"),
+            ("参考语音", "/data/ref.mp3"),
+        ]
+
+    async def test_same_name_updates_source(self, store):
+        await store.add_voice_reference("馒头", "/data/old.wav")
+
+        assert await store.add_voice_reference("馒头", "/data/new.wav") is False
+        assert await store.list_voice_references() == [("馒头", "/data/new.wav")]
+
+    async def test_same_source_moves_to_new_name(self, store):
+        await store.add_voice_reference("旧名字", "/data/ref.mp3")
+
+        await store.add_voice_reference("新名字", "/data/ref.mp3")
+
+        assert await store.list_voice_references() == [("新名字", "/data/ref.mp3")]
+
+    async def test_remove_reference(self, store):
+        await store.add_voice_reference("馒头", "/data/mantou_voice.wav")
+
+        assert await store.remove_voice_reference("馒头") is True
+        assert await store.remove_voice_reference("馒头") is False
+        assert await store.list_voice_references() == []
+
+    async def test_references_survive_restart(self, tmp_path):
+        config = make_config(tmp_path)
+        first = await open_store(config)
+        try:
+            await first.add_voice_reference("馒头", "/data/mantou_voice.wav")
+        finally:
+            await first.close()
+
+        second = await open_store(config)
+        try:
+            assert await second.list_voice_references() == [
+                ("馒头", "/data/mantou_voice.wav")
+            ]
+        finally:
+            await second.close()
+
+
 class TestSuperuserReply:
     async def test_new_group_defaults_to_enabled(self, store):
         assert await store.get_superuser_always_reply(100) is True
